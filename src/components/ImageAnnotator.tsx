@@ -3,7 +3,8 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
-import { Upload, ChevronLeft, ChevronRight, Download, Trash2, Tag, Sparkles, SlidersHorizontal, Video, Film, Pencil, Check, X, Loader2 } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Upload, ChevronLeft, ChevronRight, Download, Trash2, Tag, Sparkles, SlidersHorizontal, Video, Film, Pencil, Check, X, Loader2, FolderOpen, Scissors } from "lucide-react";
 import { toast } from "sonner";
 import * as cocoSsd from "@tensorflow-models/coco-ssd";
 import * as tf from "@tensorflow/tfjs";
@@ -28,9 +29,25 @@ interface ImageData {
   sourceVideo?: string;
 }
 
+interface ClipData {
+  name: string;
+  frames: { file: File; url: string; frameNumber: number }[];
+  sourceVideo: string;
+}
+
 type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "move" | null;
 
 export const ImageAnnotator = () => {
+  const [activeTab, setActiveTab] = useState<"clips" | "annotator">("clips");
+  
+  // Clips erstellen state
+  const [clips, setClips] = useState<ClipData[]>([]);
+  const [clipFrameInterval, setClipFrameInterval] = useState(1);
+  const [isCreatingClips, setIsCreatingClips] = useState(false);
+  const [clipProgress, setClipProgress] = useState(0);
+  const [framesPerClip, setFramesPerClip] = useState(32); // Default 32 frames per clip for YOWO
+  
+  // Annotator state
   const [images, setImages] = useState<ImageData[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -53,13 +70,24 @@ export const ImageAnnotator = () => {
   const [boundingBoxPadding, setBoundingBoxPadding] = useState(15); // Padding in %
   const [customActivityLabels, setCustomActivityLabels] = useState<string[]>([]);
   const [newCustomLabel, setNewCustomLabel] = useState("");
+  const [selectedImages, setSelectedImages] = useState<Set<number>>(new Set());
+  const [filterMotionBlur, setFilterMotionBlur] = useState(true); // Filter out blurry/walking frames
+  const [blurThreshold, setBlurThreshold] = useState(100); // Laplacian variance threshold
+  const [chunkDuration, setChunkDuration] = useState(10); // Chunk duration in minutes (1-15)
+  const [gpuBackend, setGpuBackend] = useState<string>("loading"); // Track which backend is active
+  
+  // Keyboard shortcuts for quick labeling (F, G, H keys)
+  const [quickLabelF, setQuickLabelF] = useState("MAG-Schweißen");
+  const [quickLabelG, setQuickLabelG] = useState("Putzen/Nacharbeiten");
+  const [quickLabelH, setQuickLabelH] = useState("Winkelschleifer");
   
   
   // Preset activity labels for quick selection - Schweißumfeld Tätigkeiten
   const defaultActivityLabels = [
-    "Transport", 
     "MAG-Schweißen", 
     "Putzen/Nacharbeiten", 
+    "Winkelschleifer",
+    "Transport", 
     "Zwischenkontrolle"
   ];
   
@@ -70,6 +98,8 @@ export const ImageAnnotator = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
+  const clipVideoInputRef = useRef<HTMLInputElement>(null);
+  const clipFolderInputRef = useRef<HTMLInputElement>(null);
   const [scale, setScale] = useState(1);
 
   const currentImage = images[currentIndex];
@@ -84,13 +114,16 @@ export const ImageAnnotator = () => {
           await tf.setBackend("webgpu");
           await tf.ready();
           backend = "webgpu";
+          setGpuBackend("webgpu");
           console.log("✅ WebGPU backend activated (2-3x faster!)");
-          toast.success("WebGPU aktiviert - maximale Performance! 🚀");
+          toast.success("WebGPU aktiviert - GPU-Beschleunigung aktiv! 🚀");
         } catch (webgpuError) {
           console.warn("WebGPU not available, falling back to WebGL:", webgpuError);
           await tf.setBackend("webgl");
           await tf.ready();
-          toast.success("WebGL aktiviert");
+          backend = "webgl";
+          setGpuBackend("webgl");
+          toast.info("WebGL aktiviert - WebGPU nicht verfügbar");
         }
         
         console.log(`Loading COCO-SSD model on ${backend}...`);
@@ -115,10 +148,41 @@ export const ImageAnnotator = () => {
 
   useEffect(() => {
     const handleKeyPress = (e: KeyboardEvent) => {
+      // Ignore if typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+      
+      // Only handle shortcuts in annotator tab
+      if (activeTab !== "annotator") return;
+      
       if (e.key === "d" || e.key === "D") {
         handleNext();
       } else if (e.key === "a" || e.key === "A") {
         handlePrevious();
+      } else if (e.key === " ") {
+        // Spacebar toggles selection for deletion
+        e.preventDefault();
+        if (images.length > 0) {
+          setSelectedImages(prev => {
+            const newSet = new Set(prev);
+            if (newSet.has(currentIndex)) {
+              newSet.delete(currentIndex);
+            } else {
+              newSet.add(currentIndex);
+            }
+            return newSet;
+          });
+        }
+      } else if (e.key === "f" || e.key === "F") {
+        // Quick label with F key
+        applyQuickLabel(quickLabelF);
+      } else if (e.key === "g" || e.key === "G") {
+        // Quick label with G key
+        applyQuickLabel(quickLabelG);
+      } else if (e.key === "h" || e.key === "H") {
+        // Quick label with H key
+        applyQuickLabel(quickLabelH);
       } else if (e.key === "Delete" || e.key === "Backspace") {
         if (selectedDetection !== null) {
           handleDeleteDetection(selectedDetection);
@@ -130,7 +194,30 @@ export const ImageAnnotator = () => {
 
     window.addEventListener("keydown", handleKeyPress);
     return () => window.removeEventListener("keydown", handleKeyPress);
-  }, [currentIndex, images.length, selectedDetection]);
+  }, [currentIndex, images.length, selectedDetection, quickLabelF, quickLabelG, quickLabelH, activeTab]);
+
+  // Apply quick label to all detections on current image AND unmark from deletion
+  const applyQuickLabel = (label: string) => {
+    if (images.length === 0 || !currentImage) return;
+    
+    const newImages = [...images];
+    newImages[currentIndex].detections = newImages[currentIndex].detections.map(det => ({
+      ...det,
+      label
+    }));
+    setImages(newImages);
+    
+    // Automatically unmark from deletion when labeled
+    if (selectedImages.has(currentIndex)) {
+      setSelectedImages(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(currentIndex);
+        return newSet;
+      });
+    }
+    
+    toast.success(`Label "${label}" angewendet (demarkiert)`);
+  };
 
   // Calculate scale when image loads
   const updateScale = useCallback(() => {
@@ -453,8 +540,316 @@ export const ImageAnnotator = () => {
     });
   };
 
-  // Constants for video chunking
-  const CHUNK_DURATION = 300; // 5 minutes in seconds
+  // Video chunking - use state variable for duration
+  const CHUNK_DURATION = chunkDuration * 60; // Convert minutes to seconds
+
+  // Motion blur detection using Laplacian variance
+  const detectMotionBlur = (canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D, detection: Detection): number => {
+    // Extract the person region
+    const { x, y, width, height } = detection;
+    const safeX = Math.max(0, Math.floor(x));
+    const safeY = Math.max(0, Math.floor(y));
+    const safeWidth = Math.min(Math.floor(width), canvas.width - safeX);
+    const safeHeight = Math.min(Math.floor(height), canvas.height - safeY);
+    
+    if (safeWidth <= 0 || safeHeight <= 0) return 999; // Invalid region, assume sharp
+    
+    const imageData = ctx.getImageData(safeX, safeY, safeWidth, safeHeight);
+    const data = imageData.data;
+    
+    // Convert to grayscale and compute Laplacian variance
+    const gray: number[] = [];
+    for (let i = 0; i < data.length; i += 4) {
+      gray.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    }
+    
+    // Simplified Laplacian (3x3 kernel approximation)
+    let sum = 0;
+    let sumSq = 0;
+    let count = 0;
+    
+    for (let row = 1; row < safeHeight - 1; row++) {
+      for (let col = 1; col < safeWidth - 1; col++) {
+        const idx = row * safeWidth + col;
+        // Laplacian: center * 4 - neighbors
+        const laplacian = 4 * gray[idx] - gray[idx - 1] - gray[idx + 1] - gray[idx - safeWidth] - gray[idx + safeWidth];
+        sum += laplacian;
+        sumSq += laplacian * laplacian;
+        count++;
+      }
+    }
+    
+    if (count === 0) return 999;
+    
+    const mean = sum / count;
+    const variance = (sumSq / count) - (mean * mean);
+    
+    return variance;
+  };
+
+  // ==================== CLIPS ERSTELLEN FUNKTIONEN ====================
+  
+  // Extract frames from video and create clips
+  const createClipsFromVideo = async (videoFile: File): Promise<ClipData[]> => {
+    return new Promise((resolve, reject) => {
+      const video = document.createElement('video');
+      const videoUrl = URL.createObjectURL(videoFile);
+      video.src = videoUrl;
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = 'metadata';
+      
+      const processVideo = async () => {
+        try {
+          const duration = video.duration;
+          
+          if (!duration || !isFinite(duration) || duration <= 0) {
+            toast.error("Video-Dauer konnte nicht ermittelt werden");
+            resolve([]);
+            return;
+          }
+          
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d');
+          
+          if (!ctx) {
+            toast.error("Canvas konnte nicht erstellt werden");
+            resolve([]);
+            return;
+          }
+          
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          
+          // Calculate total frames
+          const totalFrames = Math.floor(duration / clipFrameInterval);
+          // Calculate number of clips needed
+          const numClips = Math.ceil(totalFrames / framesPerClip);
+          
+          const createdClips: ClipData[] = [];
+          let globalFrameNumber = 0;
+          
+          for (let clipIdx = 0; clipIdx < numClips; clipIdx++) {
+            const clipFrames: { file: File; url: string; frameNumber: number }[] = [];
+            const clipName = `${videoFile.name.replace(/\.[^/.]+$/, "")}${String(clipIdx + 1).padStart(2, '0')}`;
+            
+            for (let frameInClip = 0; frameInClip < framesPerClip; frameInClip++) {
+              const globalFrameIdx = clipIdx * framesPerClip + frameInClip;
+              const currentTime = globalFrameIdx * clipFrameInterval;
+              
+              if (currentTime > duration) break;
+              
+              video.currentTime = currentTime;
+              
+              await new Promise<void>((seekResolve) => {
+                video.onseeked = () => seekResolve();
+              });
+              
+              ctx.drawImage(video, 0, 0);
+              
+              const blob = await new Promise<Blob>((blobResolve) => {
+                canvas.toBlob((b) => blobResolve(b!), 'image/jpeg', 0.95);
+              });
+              
+              globalFrameNumber++;
+              const frameName = `${String(frameInClip + 1).padStart(5, '0')}.jpg`;
+              const frameFile = new File([blob], frameName, { type: 'image/jpeg' });
+              
+              clipFrames.push({
+                file: frameFile,
+                url: URL.createObjectURL(blob),
+                frameNumber: frameInClip + 1
+              });
+              
+              // Update progress
+              setClipProgress(Math.round((globalFrameNumber / totalFrames) * 100));
+            }
+            
+            if (clipFrames.length > 0) {
+              createdClips.push({
+                name: clipName,
+                frames: clipFrames,
+                sourceVideo: videoFile.name
+              });
+            }
+          }
+          
+          URL.revokeObjectURL(videoUrl);
+          resolve(createdClips);
+        } catch (error) {
+          console.error("Fehler bei Video-Verarbeitung:", error);
+          toast.error("Fehler bei der Video-Verarbeitung");
+          resolve([]);
+        }
+      };
+      
+      video.onloadedmetadata = () => {
+        if (video.readyState >= 1) {
+          processVideo();
+        } else {
+          video.oncanplay = () => processVideo();
+        }
+      };
+      
+      video.onerror = () => {
+        toast.error("Fehler beim Laden des Videos");
+        URL.revokeObjectURL(videoUrl);
+        resolve([]);
+      };
+      
+      video.load();
+    });
+  };
+
+  const handleClipVideoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setIsCreatingClips(true);
+    setClipProgress(0);
+    toast.loading("Videos werden in Clips aufgeteilt...");
+
+    const allClips: ClipData[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      toast.loading(`Video ${i + 1} von ${files.length}: ${file.name}`);
+      const newClips = await createClipsFromVideo(file);
+      allClips.push(...newClips);
+    }
+
+    setClips(prev => [...prev, ...allClips]);
+    setIsCreatingClips(false);
+    setClipProgress(0);
+    
+    const totalFrames = allClips.reduce((sum, c) => sum + c.frames.length, 0);
+    toast.success(`${allClips.length} Clips mit insgesamt ${totalFrames} Frames erstellt!`);
+    
+    if (clipVideoInputRef.current) {
+      clipVideoInputRef.current.value = '';
+    }
+  };
+
+  const handleExportClips = async () => {
+    if (clips.length === 0) {
+      toast.error("Keine Clips zum Exportieren");
+      return;
+    }
+
+    const zip = new JSZip();
+    
+    for (const clip of clips) {
+      const clipFolder = zip.folder(clip.name);
+      if (!clipFolder) continue;
+      
+      for (const frame of clip.frames) {
+        const response = await fetch(frame.url);
+        const blob = await response.blob();
+        clipFolder.file(frame.file.name, blob);
+      }
+    }
+
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "clips_export.zip";
+    a.click();
+    
+    const totalFrames = clips.reduce((sum, c) => sum + c.frames.length, 0);
+    toast.success(`${clips.length} Clips mit ${totalFrames} Frames exportiert!`);
+  };
+
+  const handleLoadClipsToAnnotator = async () => {
+    if (clips.length === 0) {
+      toast.error("Keine Clips vorhanden");
+      return;
+    }
+    
+    if (!model) {
+      toast.error("KI-Modell wird noch geladen, bitte warten...");
+      return;
+    }
+    
+    setIsProcessing(true);
+    setActiveTab("annotator");
+    toast.loading("Clips werden analysiert (Personen-Erkennung)...");
+    
+    const allImages: ImageData[] = [];
+    const blurryIndices: number[] = [];
+    let totalFrames = clips.reduce((sum, c) => sum + c.frames.length, 0);
+    let processedFrames = 0;
+    
+    for (const clip of clips) {
+      for (const frame of clip.frames) {
+        // Run person detection like video upload
+        const detections = await detectObjects(frame.file, confidenceThreshold);
+        const personDetections = detections.filter(d => d.label.toLowerCase() === 'person');
+        
+        // Only keep frames with persons detected
+        if (personDetections.length > 0) {
+          const currentFrameIndex = allImages.length;
+          
+          // Check for motion blur if enabled
+          if (filterMotionBlur) {
+            // Create temp canvas for blur detection
+            const img = new Image();
+            img.src = frame.url;
+            await new Promise<void>(resolve => {
+              img.onload = () => resolve();
+              img.onerror = () => resolve();
+            });
+            
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            if (ctx && img.width > 0) {
+              canvas.width = img.width;
+              canvas.height = img.height;
+              ctx.drawImage(img, 0, 0);
+              
+              let allBlurry = true;
+              for (const detection of personDetections) {
+                const blurScore = detectMotionBlur(canvas, ctx, detection);
+                if (blurScore >= blurThreshold) {
+                  allBlurry = false;
+                  break;
+                }
+              }
+              
+              if (allBlurry) {
+                blurryIndices.push(currentFrameIndex);
+              }
+            }
+          }
+          
+          allImages.push({
+            file: frame.file,
+            url: frame.url,
+            detections: personDetections,
+            frameNumber: frame.frameNumber,
+            sourceVideo: clip.name
+          });
+        }
+        
+        processedFrames++;
+        if (processedFrames % 10 === 0) {
+          setExtractionProgress(Math.round((processedFrames / totalFrames) * 100));
+        }
+      }
+    }
+    
+    setImages(allImages);
+    setSelectedImages(new Set(blurryIndices));
+    setCurrentIndex(0);
+    setSelectedDetection(null);
+    setIsProcessing(false);
+    setExtractionProgress(0);
+    
+    const skippedCount = totalFrames - allImages.length;
+    toast.success(`${allImages.length} Frames mit Personen geladen! (${skippedCount} ohne Person übersprungen, ${blurryIndices.length} unscharf markiert)`);
+  };
+
+  // ==================== ANNOTATOR FUNKTIONEN ====================
 
   // Extract frames from a video chunk (startTime to endTime)
   const extractFramesFromChunk = async (
@@ -465,8 +860,9 @@ export const ImageAnnotator = () => {
     startTime: number,
     endTime: number,
     globalFrameOffset: number
-  ): Promise<ImageData[]> => {
+  ): Promise<{ frames: ImageData[], blurryIndices: number[] }> => {
     const frames: ImageData[] = [];
+    const blurryIndices: number[] = []; // Track indices of blurry frames
     const chunkFrames = Math.floor((endTime - startTime) / frameInterval);
     let skippedFrames = 0;
     
@@ -497,6 +893,25 @@ export const ImageAnnotator = () => {
       // Frame nur behalten wenn mindestens eine Person erkannt wurde
       if (personDetections.length > 0) {
         const url = URL.createObjectURL(blob);
+        const currentFrameIndex = frames.length;
+        
+        // Motion blur check - mark blurry frames instead of skipping
+        if (filterMotionBlur) {
+          let allBlurry = true;
+          for (const detection of personDetections) {
+            const blurScore = detectMotionBlur(canvas, ctx, detection);
+            if (blurScore >= blurThreshold) {
+              allBlurry = false;
+              break;
+            }
+          }
+          
+          if (allBlurry) {
+            blurryIndices.push(currentFrameIndex);
+            console.log(`Frame ${frameNumber}: Person(en) unscharf (in Bewegung), wird markiert`);
+          }
+        }
+        
         frames.push({
           file: frameFile,
           url,
@@ -514,11 +929,11 @@ export const ImageAnnotator = () => {
       console.log(`Chunk: ${skippedFrames} Frames ohne Person übersprungen`);
     }
     
-    return frames;
+    return { frames, blurryIndices };
   };
 
   // Extract frames from video with 5-minute chunking
-  const extractFramesFromVideo = async (videoFile: File): Promise<ImageData[]> => {
+  const extractFramesFromVideo = async (videoFile: File): Promise<{ frames: ImageData[], blurryIndices: number[] }> => {
     return new Promise((resolve, reject) => {
       const video = document.createElement('video');
       const videoUrl = URL.createObjectURL(videoFile);
@@ -536,7 +951,7 @@ export const ImageAnnotator = () => {
           
           if (!duration || !isFinite(duration) || duration <= 0) {
             toast.error("Video-Dauer konnte nicht ermittelt werden");
-            resolve([]);
+            resolve({ frames: [], blurryIndices: [] });
             return;
           }
           
@@ -545,7 +960,7 @@ export const ImageAnnotator = () => {
           
           if (!ctx) {
             toast.error("Canvas konnte nicht erstellt werden");
-            resolve([]);
+            resolve({ frames: [], blurryIndices: [] });
             return;
           }
           
@@ -553,6 +968,7 @@ export const ImageAnnotator = () => {
           canvas.height = video.videoHeight;
           
           const allFrames: ImageData[] = [];
+          const allBlurryIndices: number[] = [];
           const totalChunks = Math.ceil(duration / CHUNK_DURATION);
           const totalFrames = Math.floor(duration / frameInterval);
           let processedFrames = 0;
@@ -568,7 +984,7 @@ export const ImageAnnotator = () => {
             console.log(`Chunk ${chunkIndex + 1}/${totalChunks}: ${startTime}s - ${endTime}s`);
             toast.loading(`Chunk ${chunkIndex + 1}/${totalChunks} wird verarbeitet (${Math.floor(startTime / 60)}-${Math.floor(endTime / 60)} Min)...`);
             
-            const chunkFrames = await extractFramesFromChunk(
+            const chunkResult = await extractFramesFromChunk(
               video,
               canvas,
               ctx,
@@ -578,15 +994,26 @@ export const ImageAnnotator = () => {
               globalFrameOffset
             );
             
-            allFrames.push(...chunkFrames);
-            processedFrames += chunkFrames.length;
+            // Adjust blurry indices to global index
+            const baseIndex = allFrames.length;
+            const adjustedBlurryIndices = chunkResult.blurryIndices.map(i => baseIndex + i);
+            
+            allFrames.push(...chunkResult.frames);
+            allBlurryIndices.push(...adjustedBlurryIndices);
+            processedFrames += chunkResult.frames.length;
             
             setExtractionProgress(Math.round((processedFrames / (totalFrames + 1)) * 100));
             
             // Add extracted chunk frames to state immediately so user can see progress
             if (chunkIndex < totalChunks - 1) {
-              setImages(prev => [...prev, ...chunkFrames]);
-              toast.success(`Chunk ${chunkIndex + 1}/${totalChunks} fertig (${chunkFrames.length} Frames)`);
+              setImages(prev => [...prev, ...chunkResult.frames]);
+              // Also mark blurry frames
+              setSelectedImages(prev => {
+                const newSet = new Set(prev);
+                adjustedBlurryIndices.forEach(i => newSet.add(i));
+                return newSet;
+              });
+              toast.success(`Chunk ${chunkIndex + 1}/${totalChunks} fertig (${chunkResult.frames.length} Frames)`);
               
               // Small delay to let browser breathe
               await new Promise(r => setTimeout(r, 100));
@@ -594,11 +1021,11 @@ export const ImageAnnotator = () => {
           }
           
           URL.revokeObjectURL(videoUrl);
-          resolve(allFrames);
+          resolve({ frames: allFrames, blurryIndices: allBlurryIndices });
         } catch (error) {
           console.error("Fehler bei Video-Verarbeitung:", error);
           toast.error("Fehler bei der Video-Verarbeitung");
-          resolve([]);
+          resolve({ frames: [], blurryIndices: [] });
         }
       };
       
@@ -619,7 +1046,7 @@ export const ImageAnnotator = () => {
         console.error("Video Ladefehler:", e);
         toast.error("Fehler beim Laden des Videos - Format wird möglicherweise nicht unterstützt");
         URL.revokeObjectURL(videoUrl);
-        resolve([]);
+        resolve({ frames: [], blurryIndices: [] });
       };
       
       // Force load
@@ -641,22 +1068,32 @@ export const ImageAnnotator = () => {
     toast.loading("Video wird in Frames zerlegt...");
 
     const allFrames: ImageData[] = [];
+    const allBlurryIndices: number[] = [];
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       toast.loading(`Video ${i + 1} von ${files.length} wird verarbeitet...`);
-      const frames = await extractFramesFromVideo(file);
-      allFrames.push(...frames);
+      const result = await extractFramesFromVideo(file);
+      
+      // Adjust blurry indices to global index
+      const baseIndex = allFrames.length;
+      const adjustedBlurryIndices = result.blurryIndices.map(idx => baseIndex + idx);
+      
+      allFrames.push(...result.frames);
+      allBlurryIndices.push(...adjustedBlurryIndices);
     }
 
     setImages(allFrames);
+    // Automatically mark blurry frames
+    setSelectedImages(new Set(allBlurryIndices));
     setCurrentIndex(0);
     setSelectedDetection(null);
     setIsProcessing(false);
     setExtractionProgress(0);
     
+    const blurryCount = allBlurryIndices.length;
     const totalDetections = allFrames.reduce((sum, img) => sum + img.detections.length, 0);
-    toast.success(`${allFrames.length} Frames mit Personen behalten, ${totalDetections} Personen erkannt! (Frames ohne Person wurden verworfen)`);
+    toast.success(`${allFrames.length} Frames, ${totalDetections} Personen erkannt! ${blurryCount > 0 ? `(${blurryCount} unscharfe Frames automatisch markiert)` : ''}`);
     
     // Reset input
     if (videoInputRef.current) {
@@ -753,72 +1190,145 @@ export const ImageAnnotator = () => {
     toast.success("Bilder zurückgesetzt!");
   };
 
+  // Export structure (exact as requested):
+  // {LabelName}/
+  //   {LabelName}_labeled/{LabelName}01.json
+  //   {LabelName}_unlabeled/{LabelName}01.jpg
+  // (paired by identical base-name; marked images are excluded)
   const handleExport = async () => {
     const zip = new JSZip();
 
-    const imagesWithDetections = images.filter(img => img.detections.length > 0);
-    
-    if (imagesWithDetections.length === 0) {
-      toast.error("Keine Bilder mit Erkennungen zum Exportieren!");
+    // Default labels that should NOT be exported (COCO-SSD labels)
+    const cocoLabels = new Set(
+      [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+        "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+        "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+        "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+        "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+        "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+        "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
+        "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book",
+        "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
+      ].map((l) => l.toLowerCase())
+    );
+
+    // Windows-safe path segment but keeps the visual look (e.g. "/" -> "／")
+    const toSafePathSegment = (name: string) =>
+      name
+        .trim()
+        .replace(/\\/g, "＼")
+        .replace(/\//g, "／")
+        .replace(/:/g, "：")
+        .replace(/\*/g, "＊")
+        .replace(/\?/g, "？")
+        .replace(/"/g, "＂")
+        .replace(/</g, "＜")
+        .replace(/>/g, "＞")
+        .replace(/\|/g, "｜");
+
+    // Get all non-deleted images (exclude marked ones)
+    const validImages = images
+      .map((img, idx) => ({ img, idx }))
+      .filter(({ idx }) => !selectedImages.has(idx));
+
+    if (validImages.length === 0) {
+      toast.error("Keine Frames zum Exportieren (alle markiert oder keine vorhanden)");
       return;
     }
 
-    // Gruppiere Bilder nach Tätigkeitskategorie (Label der ersten Detection)
-    const categoryFolders: { [category: string]: typeof imagesWithDetections } = {};
-    
-    for (const img of imagesWithDetections) {
-      // Nimm das Label der ersten Detektion als Kategorie
-      const category = img.detections[0]?.label || "Ohne_Kategorie";
-      // Sanitize folder name (entferne Sonderzeichen, ersetze Leerzeichen)
-      const safeCategoryName = category.replace(/[\/\\:*?"<>|]/g, "_").replace(/\s+/g, "_");
-      
-      if (!categoryFolders[safeCategoryName]) {
-        categoryFolders[safeCategoryName] = [];
+    // Determine activity label from detections (first non-COCO label)
+    const getCustomLabel = (img: ImageData): string | null => {
+      for (const det of img.detections) {
+        const raw = (det.label ?? "").trim();
+        if (!raw) continue;
+        if (!cocoLabels.has(raw.toLowerCase())) return raw;
       }
-      categoryFolders[safeCategoryName].push(img);
+      return null;
+    };
+
+    const labeledItems = validImages
+      .map(({ img, idx }) => ({ img, idx, label: getCustomLabel(img) }))
+      .filter((x): x is { img: ImageData; idx: number; label: string } => x.label !== null);
+
+    if (labeledItems.length === 0) {
+      toast.error("Keine gelabelten Frames vorhanden! Bitte zuerst Labels vergeben (F/G/H Tasten).");
+      return;
     }
 
-    let exportedCount = 0;
-    
-    for (const [categoryName, categoryImages] of Object.entries(categoryFolders)) {
-      // Erstelle Ordner für jede Kategorie
-      const folder = zip.folder(categoryName);
-      if (!folder) continue;
-      
-      for (let i = 0; i < categoryImages.length; i++) {
-        const img = categoryImages[i];
-        const imgElement = new Image();
-        imgElement.src = img.url;
+    // Group by label
+    const byLabel = new Map<string, { img: ImageData; idx: number }[]>();
+    for (const item of labeledItems) {
+      if (!byLabel.has(item.label)) byLabel.set(item.label, []);
+      byLabel.get(item.label)!.push({ img: item.img, idx: item.idx });
+    }
 
-        await new Promise((resolve) => {
+    // Stable ordering: clip name then frame number
+    byLabel.forEach((items) => {
+      items.sort((a, b) => {
+        const clipA = a.img.sourceVideo ?? "";
+        const clipB = b.img.sourceVideo ?? "";
+        if (clipA !== clipB) return clipA.localeCompare(clipB);
+        return (a.img.frameNumber ?? 0) - (b.img.frameNumber ?? 0);
+      });
+    });
+
+    let totalExported = 0;
+
+    for (const [label, items] of byLabel) {
+      const safeLabel = toSafePathSegment(label);
+
+      const labelFolder = zip.folder(safeLabel);
+      if (!labelFolder) continue;
+
+      const labeledFolder = labelFolder.folder(`${safeLabel}_labeled`);
+      const unlabeledFolder = labelFolder.folder(`${safeLabel}_unlabeled`);
+      if (!labeledFolder || !unlabeledFolder) continue;
+
+      let counter = 0;
+
+      for (const { img } of items) {
+        counter++;
+        totalExported++;
+
+        const baseName = `${safeLabel}${String(counter).padStart(2, "0")}`;
+
+        // Write JPG to *_unlabeled
+        const response = await fetch(img.url);
+        const blob = await response.blob();
+        unlabeledFolder.file(`${baseName}.jpg`, blob);
+
+        // Write JSON to *_labeled
+        const customDetections = img.detections.filter((d) => {
+          const l = (d.label ?? "").trim();
+          if (!l) return false;
+          return !cocoLabels.has(l.toLowerCase());
+        });
+
+        await new Promise<void>((resolve) => {
+          const imgElement = new Image();
+          imgElement.src = img.url;
           imgElement.onload = () => {
-            const labelBeeFormat = {
+            const annotation = {
+              image: `${baseName}.jpg`,
               width: imgElement.width,
               height: imgElement.height,
-              valid: true,
-              rotate: 0,
-              step_1: {
-                toolName: "rectTool",
-                result: img.detections.map((detection, idx) => ({
-                  x: detection.x,
-                  y: detection.y,
-                  width: detection.width,
-                  height: detection.height,
-                  attribute: detection.label,
-                  valid: true,
-                  id: `detect_${exportedCount}_${idx}`,
-                  sourceID: "",
-                  textAttribute: "",
-                  order: idx + 1,
-                })),
-              },
+              sourceVideo: img.sourceVideo ?? null,
+              frameNumber: img.frameNumber ?? null,
+              annotations: customDetections.map((det) => ({
+                label: det.label,
+                x: Math.round(det.x),
+                y: Math.round(det.y),
+                width: Math.round(det.width),
+                height: Math.round(det.height),
+                confidence: det.confidence,
+              })),
             };
-
-            const jsonFilename = img.file.name.replace(/\.[^/.]+$/, "") + ".json";
-            folder.file(jsonFilename, JSON.stringify(labelBeeFormat, null, 2));
-            exportedCount++;
-            resolve(null);
+            labeledFolder.file(`${baseName}.json`, JSON.stringify(annotation, null, 2));
+            resolve();
           };
+          imgElement.onerror = () => resolve();
         });
       }
     }
@@ -827,20 +1337,13 @@ export const ImageAnnotator = () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "annotations.zip";
+    a.download = "dataset_export.zip";
     a.click();
-    
-    const categoryCount = Object.keys(categoryFolders).length;
-    const skipped = images.length - imagesWithDetections.length;
-    const categoryList = Object.keys(categoryFolders).join(", ");
-    
-    if (skipped > 0) {
-      toast.success(`${exportedCount} Annotationen in ${categoryCount} Ordner exportiert: ${categoryList} (${skipped} ohne Erkennung übersprungen)`);
-    } else {
-      toast.success(`${exportedCount} Annotationen in ${categoryCount} Ordner exportiert: ${categoryList}`);
-    }
-  };
 
+    const skipped = selectedImages.size;
+    const labels = Array.from(byLabel.keys());
+    toast.success(`Export: ${labels.join(", ")} (${totalExported} Dateien, ${skipped} übersprungen)`);
+  };
 
   return (
     <div className="min-h-screen bg-background p-6">
@@ -850,216 +1353,284 @@ export const ImageAnnotator = () => {
           <div>
             <h1 className="text-3xl font-bold text-foreground flex items-center gap-2">
               <Sparkles className="w-8 h-8 text-primary" />
-              Auto-Annotator
+              YOWO Datensatz-Tool
             </h1>
             <p className="text-muted-foreground mt-1">
-              Automatische Erkennung aller Objekte mit KI (COCO-SSD)
+              Clips erstellen & Labels vergeben für Aktivitätserkennung
             </p>
-          </div>
-          
-          <div className="flex gap-3 flex-wrap">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              multiple
-              onChange={handleFileUpload}
-              className="hidden"
-            />
-            <input
-              ref={videoInputRef}
-              type="file"
-              accept="video/*"
-              multiple
-              onChange={handleVideoUpload}
-              className="hidden"
-            />
-            <Button
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isProcessing}
-              variant="default"
-            >
-              <Upload className="w-4 h-4 mr-2" />
-              Bilder
-            </Button>
-            <Button
-              onClick={() => videoInputRef.current?.click()}
-              disabled={isProcessing}
-              variant="secondary"
-            >
-              <Video className="w-4 h-4 mr-2" />
-              Video
-            </Button>
-            
-            {images.length > 0 && (
-              <>
-                <Button onClick={handleExport} variant="outline">
-                  <Download className="w-4 h-4 mr-2" />
-                  Exportieren
-                </Button>
-                <Button onClick={handleReset} variant="ghost">
-                  Zurücksetzen
-                </Button>
-              </>
-            )}
           </div>
         </div>
 
-        {/* Progress bar for video extraction */}
-        {isProcessing && extractionProgress > 0 && (
-          <Card className="p-4">
-            <div className="flex items-center gap-3">
-              <Film className="w-5 h-5 text-primary animate-pulse" />
-              <div className="flex-1">
-                <div className="flex justify-between text-sm mb-1">
-                  <span>Frames werden extrahiert...</span>
-                  <span>{extractionProgress}%</span>
-                </div>
-                <div className="w-full bg-secondary rounded-full h-2">
-                  <div 
-                    className="bg-primary h-2 rounded-full transition-all duration-300"
-                    style={{ width: `${extractionProgress}%` }}
-                  />
-                </div>
-              </div>
-            </div>
-          </Card>
-        )}
+        {/* Tab Navigation */}
+        <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as "clips" | "annotator")}>
+          <TabsList className="grid w-full grid-cols-2 max-w-md">
+            <TabsTrigger value="clips" className="flex items-center gap-2">
+              <Scissors className="w-4 h-4" />
+              Clips erstellen
+            </TabsTrigger>
+            <TabsTrigger value="annotator" className="flex items-center gap-2">
+              <Tag className="w-4 h-4" />
+              Auto-Annotator
+            </TabsTrigger>
+          </TabsList>
 
-        {/* Main Content */}
-        {images.length === 0 ? (
-          <Card className="p-12 text-center border-dashed border-2">
-            <div className="flex justify-center gap-4 mb-6">
-              <Upload className="w-12 h-12 text-muted-foreground" />
-              <Video className="w-12 h-12 text-muted-foreground" />
-            </div>
-            <h3 className="text-xl font-semibold mb-2">Keine Medien geladen</h3>
-            <p className="text-muted-foreground mb-6">
-              Laden Sie Bilder oder Videos hoch, um die automatische Erkennung zu starten
-            </p>
-            <div className="flex gap-4 justify-center flex-wrap">
-              <Button onClick={() => fileInputRef.current?.click()}>
-                <Upload className="w-4 h-4 mr-2" />
-                Bilder auswählen
-              </Button>
-              <Button onClick={() => videoInputRef.current?.click()} variant="secondary">
-                <Video className="w-4 h-4 mr-2" />
-                Video auswählen
-              </Button>
-            </div>
-            <div className="mt-6 p-4 bg-secondary/50 rounded-lg max-w-lg mx-auto space-y-4">
-              <div>
-                <p className="text-sm text-muted-foreground mb-2">
-                  <strong>Video-Einstellung:</strong> Frame-Intervall
-                </p>
-                <div className="flex items-center gap-3">
-                  <span className="text-sm w-8">{frameInterval}s</span>
-                  <Slider
-                    value={[frameInterval]}
-                    onValueChange={([v]) => setFrameInterval(v)}
-                    min={0.5}
-                    max={5}
-                    step={0.5}
-                    className="flex-1"
-                  />
-                </div>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Extrahiert einen Frame alle {frameInterval} Sekunden
-                </p>
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground mb-2">
-                  <strong>Bounding Box Padding:</strong> {boundingBoxPadding}%
-                </p>
-                <div className="flex items-center gap-3">
-                  <span className="text-sm w-8">{boundingBoxPadding}%</span>
-                  <Slider
-                    value={[boundingBoxPadding]}
-                    onValueChange={([v]) => setBoundingBoxPadding(v)}
-                    min={0}
-                    max={50}
-                    step={5}
-                    className="flex-1"
-                  />
-                </div>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Erweitert Erkennungsboxen um {boundingBoxPadding}% links/rechts für Werkzeuge
-                </p>
-              </div>
-            </div>
-          </Card>
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-            {/* Canvas Area */}
-            <Card className="lg:col-span-3 p-6 bg-canvas-bg">
+          {/* ==================== CLIPS ERSTELLEN TAB ==================== */}
+          <TabsContent value="clips" className="space-y-6">
+            <Card className="p-6">
               <div className="flex items-center justify-between mb-4">
-                <span className="text-sm text-muted-foreground">
-                  Bild {currentIndex + 1} von {images.length}
-                </span>
-                <span className="text-sm text-primary font-medium">
-                  {currentImage.detections.length} Erkennungen
-                </span>
-              </div>
-              
-              <div ref={containerRef} className="relative bg-black/20 rounded-lg overflow-hidden">
-                <canvas
-                  ref={canvasRef}
-                  className="max-w-full h-auto mx-auto"
-                  style={{ cursor: getCursorStyle() }}
-                  onMouseDown={handleCanvasMouseDown}
-                  onMouseMove={handleCanvasMouseMove}
-                  onMouseUp={handleCanvasMouseUp}
-                  onMouseLeave={handleCanvasMouseUp}
-                />
-              </div>
-
-              {/* Navigation */}
-              <div className="flex items-center justify-between mt-6">
-                <Button
-                  onClick={handlePrevious}
-                  disabled={currentIndex === 0}
-                  variant="secondary"
-                >
-                  <ChevronLeft className="w-4 h-4 mr-2" />
-                  Zurück (A)
-                </Button>
-                
-                <div className="text-center">
-                  <span className="text-sm text-muted-foreground">
-                    {currentImage.file.name}
-                  </span>
-                  {currentImage.sourceVideo && (
-                    <span className="block text-xs text-primary mt-1">
-                      <Film className="w-3 h-3 inline mr-1" />
-                      Frame {(currentImage.frameNumber ?? 0) + 1} aus {currentImage.sourceVideo}
-                    </span>
+                <h2 className="text-xl font-semibold flex items-center gap-2">
+                  <FolderOpen className="w-5 h-5" />
+                  Video zu Clips
+                </h2>
+                <div className="flex gap-3">
+                  <input
+                    ref={clipVideoInputRef}
+                    type="file"
+                    accept="video/*"
+                    multiple
+                    onChange={handleClipVideoUpload}
+                    className="hidden"
+                  />
+                  <Button
+                    onClick={() => clipVideoInputRef.current?.click()}
+                    disabled={isCreatingClips}
+                  >
+                    <Video className="w-4 h-4 mr-2" />
+                    Video(s) auswählen
+                  </Button>
+                  {clips.length > 0 && (
+                    <>
+                      <Button onClick={handleLoadClipsToAnnotator} variant="default" disabled={isProcessing || !model}>
+                        {isProcessing ? (
+                          <>
+                            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                            Analysiere...
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="w-4 h-4 mr-2" />
+                            Weiter zum Annotator
+                          </>
+                        )}
+                      </Button>
+                      <Button onClick={() => setClips([])} variant="ghost">
+                        Zurücksetzen
+                      </Button>
+                    </>
                   )}
                 </div>
-                
-                <Button
-                  onClick={handleNext}
-                  disabled={currentIndex === images.length - 1}
-                  variant="default"
-                >
-                  Weiter (D)
-                  <ChevronRight className="w-4 h-4 ml-2" />
-                </Button>
               </div>
-            </Card>
 
-            {/* Sidebar */}
-            <Card className="p-6 space-y-4">
-              {/* Auto Label Settings */}
-              <div className="pb-4 border-b border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2">
-                  <SlidersHorizontal className="w-4 h-4" />
-                  Auto-Label Einstellungen
-                </h3>
+              {/* Settings */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
                 <div className="space-y-3">
                   <div>
                     <div className="flex justify-between text-sm mb-2">
-                      <span className="text-muted-foreground">Konfidenz-Schwellenwert</span>
-                      <span className="font-medium">{(confidenceThreshold * 100).toFixed(0)}%</span>
+                      <span className="text-muted-foreground font-medium">Frame-Intervall</span>
+                      <span className="font-bold">{clipFrameInterval}s</span>
+                    </div>
+                    <Slider
+                      value={[clipFrameInterval]}
+                      onValueChange={([v]) => setClipFrameInterval(v)}
+                      min={0.5}
+                      max={5}
+                      step={0.5}
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Extrahiert einen Frame alle {clipFrameInterval} Sekunden
+                    </p>
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  <div>
+                    <div className="flex justify-between text-sm mb-2">
+                      <span className="text-muted-foreground font-medium">Frames pro Clip</span>
+                      <span className="font-bold">{framesPerClip}</span>
+                    </div>
+                    <Slider
+                      value={[framesPerClip]}
+                      onValueChange={([v]) => setFramesPerClip(v)}
+                      min={8}
+                      max={64}
+                      step={8}
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      YOWO Standard: 32 Frames pro Clip
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Progress */}
+              {isCreatingClips && clipProgress > 0 && (
+                <div className="mb-6">
+                  <div className="flex items-center gap-3">
+                    <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                    <div className="flex-1">
+                      <div className="flex justify-between text-sm mb-1">
+                        <span>Clips werden erstellt...</span>
+                        <span>{clipProgress}%</span>
+                      </div>
+                      <div className="w-full bg-secondary rounded-full h-2">
+                        <div 
+                          className="bg-primary h-2 rounded-full transition-all duration-300"
+                          style={{ width: `${clipProgress}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Clips List */}
+              {clips.length === 0 ? (
+                <div className="text-center py-12 border-2 border-dashed rounded-lg">
+                  <Video className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
+                  <h3 className="text-lg font-semibold mb-2">Keine Clips</h3>
+                  <p className="text-muted-foreground mb-4">
+                    Laden Sie ein Video hoch, um es automatisch in Clips aufzuteilen
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    Jeder Clip enthält {framesPerClip} Frames im Abstand von {clipFrameInterval}s
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-sm text-muted-foreground">
+                    <span>{clips.length} Clips erstellt</span>
+                    <span>{clips.reduce((sum, c) => sum + c.frames.length, 0)} Frames gesamt</span>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 max-h-96 overflow-y-auto">
+                    {clips.map((clip, idx) => (
+                      <div key={idx} className="bg-secondary rounded-lg p-3 text-center">
+                        <div className="text-xs text-muted-foreground mb-1">Clip {idx + 1}</div>
+                        <div className="font-medium text-sm truncate" title={clip.name}>{clip.name}</div>
+                        <div className="text-xs text-primary mt-1">{clip.frames.length} Frames</div>
+                        {clip.frames[0] && (
+                          <img 
+                            src={clip.frames[0].url} 
+                            alt={clip.name}
+                            className="w-full h-16 object-cover rounded mt-2"
+                          />
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </Card>
+          </TabsContent>
+
+          {/* ==================== ANNOTATOR TAB ==================== */}
+          <TabsContent value="annotator" className="space-y-6">
+            {/* Action Buttons */}
+            <div className="flex gap-3 flex-wrap">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                onChange={handleFileUpload}
+                className="hidden"
+              />
+              <input
+                ref={videoInputRef}
+                type="file"
+                accept="video/*"
+                multiple
+                onChange={handleVideoUpload}
+                className="hidden"
+              />
+              <Button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isProcessing}
+                variant="default"
+              >
+                <Upload className="w-4 h-4 mr-2" />
+                Bilder
+              </Button>
+              <Button
+                onClick={() => videoInputRef.current?.click()}
+                disabled={isProcessing}
+                variant="secondary"
+              >
+                <Video className="w-4 h-4 mr-2" />
+                Video
+              </Button>
+              
+              {images.length > 0 && (
+                <>
+                  <Button onClick={handleExport} variant="default">
+                    <Download className="w-4 h-4 mr-2" />
+                    Exportieren
+                  </Button>
+                  <Button onClick={handleReset} variant="ghost">
+                    Zurücksetzen
+                  </Button>
+                </>
+              )}
+            </div>
+
+            {/* Progress bar for video extraction */}
+            {isProcessing && extractionProgress > 0 && (
+              <Card className="p-4">
+                <div className="flex items-center gap-3">
+                  <Film className="w-5 h-5 text-primary animate-pulse" />
+                  <div className="flex-1">
+                    <div className="flex justify-between text-sm mb-1">
+                      <span>Frames werden extrahiert...</span>
+                      <span>{extractionProgress}%</span>
+                    </div>
+                    <div className="w-full bg-secondary rounded-full h-2">
+                      <div 
+                        className="bg-primary h-2 rounded-full transition-all duration-300"
+                        style={{ width: `${extractionProgress}%` }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </Card>
+            )}
+
+            {/* Main Content */}
+            {images.length === 0 ? (
+              <Card className="p-12 text-center border-dashed border-2">
+                <div className="flex justify-center gap-4 mb-6">
+                  <Upload className="w-12 h-12 text-muted-foreground" />
+                  <Video className="w-12 h-12 text-muted-foreground" />
+                </div>
+                <h3 className="text-xl font-semibold mb-2">Keine Medien geladen</h3>
+                <p className="text-muted-foreground mb-6">
+                  Laden Sie Bilder oder Videos hoch, oder nutzen Sie "Clips erstellen" zuerst
+                </p>
+                <div className="flex gap-4 justify-center flex-wrap">
+                  <Button onClick={() => fileInputRef.current?.click()}>
+                    <Upload className="w-4 h-4 mr-2" />
+                    Bilder auswählen
+                  </Button>
+                  <Button onClick={() => videoInputRef.current?.click()} variant="secondary">
+                    <Video className="w-4 h-4 mr-2" />
+                    Video auswählen
+                  </Button>
+                  <Button onClick={() => setActiveTab("clips")} variant="outline">
+                    <Scissors className="w-4 h-4 mr-2" />
+                    Clips erstellen
+                  </Button>
+                </div>
+                <div className="mt-6 p-4 bg-secondary/50 rounded-lg max-w-lg mx-auto space-y-4">
+                  {/* GPU Status */}
+                  <div className="flex items-center justify-between p-2 rounded bg-secondary/80">
+                    <span className="text-sm font-medium">GPU-Backend:</span>
+                    <span className={`text-sm font-bold ${gpuBackend === 'webgpu' ? 'text-green-500' : gpuBackend === 'webgl' ? 'text-yellow-500' : 'text-muted-foreground'}`}>
+                      {gpuBackend === 'loading' ? '⏳ Lädt...' : gpuBackend === 'webgpu' ? '✅ WebGPU (GPU)' : '⚠️ WebGL (Fallback)'}
+                    </span>
+                  </div>
+                  
+                  {/* Konfidenz-Schwellenwert - moved to front */}
+                  <div>
+                    <div className="flex justify-between text-sm mb-2">
+                      <span className="text-muted-foreground font-medium">Konfidenz-Schwellenwert</span>
+                      <span className="font-bold">{(confidenceThreshold * 100).toFixed(0)}%</span>
                     </div>
                     <Slider
                       value={[confidenceThreshold]}
@@ -1067,520 +1638,801 @@ export const ImageAnnotator = () => {
                       min={0.1}
                       max={0.95}
                       step={0.05}
-                      className="w-full"
+                      className="flex-1"
                     />
                     <p className="text-xs text-muted-foreground mt-1">
-                      Niedrigerer Wert = mehr Erkennungen
+                      Niedrigerer Wert = mehr Erkennungen, höher = genauer
+                    </p>
+                  </div>
+
+                  {/* Video Chunk Duration */}
+                  <div>
+                    <div className="flex justify-between text-sm mb-2">
+                      <span className="text-muted-foreground font-medium">Video-Chunk Größe</span>
+                      <span className="font-bold">{chunkDuration} Min</span>
+                    </div>
+                    <Slider
+                      value={[chunkDuration]}
+                      onValueChange={([v]) => setChunkDuration(v)}
+                      min={1}
+                      max={15}
+                      step={1}
+                      className="flex-1"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Größere Chunks = schneller, aber mehr RAM-Verbrauch
+                    </p>
+                  </div>
+
+                  <div>
+                    <p className="text-sm text-muted-foreground mb-2">
+                      <strong>Frame-Intervall</strong>
+                    </p>
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm w-8">{frameInterval}s</span>
+                      <Slider
+                        value={[frameInterval]}
+                        onValueChange={([v]) => setFrameInterval(v)}
+                        min={0.5}
+                        max={5}
+                        step={0.5}
+                        className="flex-1"
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Extrahiert einen Frame alle {frameInterval} Sekunden
                     </p>
                   </div>
                   <div>
-                    <div className="flex justify-between text-sm mb-2">
-                      <span className="text-muted-foreground">Video Frame-Intervall</span>
-                      <span className="font-medium">{frameInterval}s</span>
+                    <p className="text-sm text-muted-foreground mb-2">
+                      <strong>Bounding Box Padding:</strong> {boundingBoxPadding}%
+                    </p>
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm w-8">{boundingBoxPadding}%</span>
+                      <Slider
+                        value={[boundingBoxPadding]}
+                        onValueChange={([v]) => setBoundingBoxPadding(v)}
+                        min={0}
+                        max={50}
+                        step={5}
+                        className="flex-1"
+                      />
                     </div>
-                    <Slider
-                      value={[frameInterval]}
-                      onValueChange={([v]) => setFrameInterval(v)}
-                      min={0.5}
-                      max={5}
-                      step={0.5}
-                      className="w-full"
-                    />
                     <p className="text-xs text-muted-foreground mt-1">
-                      Frame alle {frameInterval} Sekunden extrahieren
+                      Erweitert Erkennungsboxen um {boundingBoxPadding}% links/rechts für Werkzeuge
                     </p>
                   </div>
                   <div>
-                    <div className="flex justify-between text-sm mb-2">
-                      <span className="text-muted-foreground">Bounding Box Padding</span>
-                      <span className="font-medium">{boundingBoxPadding}%</span>
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-sm text-muted-foreground">
+                        <strong>Bewegungsunschärfe filtern:</strong>
+                      </p>
+                      <Button
+                        variant={filterMotionBlur ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setFilterMotionBlur(!filterMotionBlur)}
+                      >
+                        {filterMotionBlur ? "Aktiv" : "Aus"}
+                      </Button>
                     </div>
-                    <Slider
-                      value={[boundingBoxPadding]}
-                      onValueChange={([v]) => setBoundingBoxPadding(v)}
-                      min={0}
-                      max={50}
-                      step={5}
-                      className="w-full"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Erweitert Box um {boundingBoxPadding}% links/rechts
-                    </p>
-                  </div>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    className="w-full"
-                    onClick={handleRedetect}
-                    disabled={isProcessing || images.length === 0}
-                  >
-                    <Sparkles className="w-3 h-3 mr-2" />
-                    Erneut erkennen
-                  </Button>
-                </div>
-              </div>
-
-
-              {/* Batch Label Bereich */}
-              <div className="pb-4 border-b border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2">
-                  <Tag className="w-4 h-4" />
-                  Bereich labeln
-                </h3>
-                <p className="text-xs text-muted-foreground mb-2">
-                  Bild-Bereich auswählen und Label zuweisen
-                </p>
-                <div className="space-y-2">
-                  <div className="flex gap-2 items-center">
-                    <Input
-                      type="number"
-                      min={1}
-                      max={images.length}
-                      placeholder="Von"
-                      className="text-sm w-20"
-                      id="batch-from"
-                    />
-                    <span className="text-muted-foreground">-</span>
-                    <Input
-                      type="number"
-                      min={1}
-                      max={images.length}
-                      placeholder="Bis"
-                      className="text-sm w-20"
-                      id="batch-to"
-                    />
-                  </div>
-                  <select
-                    id="batch-label-select"
-                    className="w-full h-9 rounded-md border border-input bg-background px-3 py-1 text-sm"
-                  >
-                    <option value="">Label wählen...</option>
-                    {activityLabels.map((label) => (
-                      <option key={label} value={label}>{label}</option>
-                    ))}
-                  </select>
-                  <Button
-                    size="sm"
-                    className="w-full"
-                    disabled={isProcessing || !model}
-                    onClick={async () => {
-                      const fromInput = document.getElementById('batch-from') as HTMLInputElement;
-                      const toInput = document.getElementById('batch-to') as HTMLInputElement;
-                      const labelSelect = document.getElementById('batch-label-select') as HTMLSelectElement;
-                      
-                      const from = parseInt(fromInput.value) - 1; // Convert to 0-indexed
-                      const to = parseInt(toInput.value) - 1;
-                      const label = labelSelect.value;
-                      
-                      if (isNaN(from) || isNaN(to)) {
-                        toast.error("Bitte Bereich eingeben (Von - Bis)");
-                        return;
-                      }
-                      if (!label) {
-                        toast.error("Bitte Label auswählen");
-                        return;
-                      }
-                      if (from < 0 || to >= images.length || from > to) {
-                        toast.error(`Ungültiger Bereich. Muss zwischen 1 und ${images.length} sein.`);
-                        return;
-                      }
-                      
-                      setIsProcessing(true);
-                      const newImages = [...images];
-                      let detectedCount = 0;
-                      
-                      for (let i = from; i <= to; i++) {
-                        // Wenn keine Detektionen vorhanden, führe Personen-Erkennung durch
-                        if (newImages[i].detections.length === 0 && model) {
-                          const detections = await detectObjects(newImages[i].file, confidenceThreshold);
-                          // Nur "Person" Detektionen behalten und mit dem Label versehen
-                          const personDetections = detections
-                            .filter(d => d.label.toLowerCase() === 'person')
-                            .map(d => ({ ...d, label }));
-                          newImages[i].detections = personDetections;
-                          if (personDetections.length > 0) detectedCount++;
-                        } else {
-                          // Bestehende Detektionen nur umbenennen
-                          newImages[i].detections = newImages[i].detections.map(d => ({
-                            ...d,
-                            label: label
-                          }));
-                        }
-                      }
-                      
-                      setImages(newImages);
-                      setIsProcessing(false);
-                      toast.success(`Bilder ${from + 1}-${to + 1} auf "${label}" gesetzt (${to - from + 1} Bilder, ${detectedCount} neu erkannt)`);
-                    }}
-                  >
-                    {isProcessing ? (
+                    {filterMotionBlur && (
                       <>
-                        <Loader2 className="w-3 h-3 animate-spin mr-1" />
-                        Erkenne Personen...
+                        <div className="flex items-center gap-3">
+                          <span className="text-sm w-10">{blurThreshold}</span>
+                          <Slider
+                            value={[blurThreshold]}
+                            onValueChange={([v]) => setBlurThreshold(v)}
+                            min={50}
+                            max={300}
+                            step={10}
+                            className="flex-1"
+                          />
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Höher = weniger streng (mehr Bilder behalten). Niedrig = strenger (mehr unscharfe Bilder filtern)
+                        </p>
                       </>
-                    ) : (
-                      "Bereich labeln"
                     )}
-                  </Button>
-                </div>
-                
-                {/* Quick range buttons */}
-                <div className="mt-3 pt-3 border-t border-border/50">
-                  <p className="text-xs text-muted-foreground mb-2">Schnell-Bereiche:</p>
-                  <div className="flex flex-wrap gap-1">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="text-xs h-6 px-2"
-                      onClick={() => {
-                        const fromInput = document.getElementById('batch-from') as HTMLInputElement;
-                        const toInput = document.getElementById('batch-to') as HTMLInputElement;
-                        fromInput.value = "1";
-                        toInput.value = String(Math.min(50, images.length));
-                      }}
-                    >
-                      1-50
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="text-xs h-6 px-2"
-                      onClick={() => {
-                        const fromInput = document.getElementById('batch-from') as HTMLInputElement;
-                        const toInput = document.getElementById('batch-to') as HTMLInputElement;
-                        fromInput.value = "51";
-                        toInput.value = String(Math.min(100, images.length));
-                      }}
-                    >
-                      51-100
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="text-xs h-6 px-2"
-                      onClick={() => {
-                        const fromInput = document.getElementById('batch-from') as HTMLInputElement;
-                        const toInput = document.getElementById('batch-to') as HTMLInputElement;
-                        fromInput.value = String(currentIndex + 1);
-                        toInput.value = String(images.length);
-                      }}
-                    >
-                      Ab hier
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="text-xs h-6 px-2"
-                      onClick={() => {
-                        const fromInput = document.getElementById('batch-from') as HTMLInputElement;
-                        const toInput = document.getElementById('batch-to') as HTMLInputElement;
-                        fromInput.value = "1";
-                        toInput.value = String(images.length);
-                      }}
-                    >
-                      Alle
-                    </Button>
                   </div>
                 </div>
-                
-                {/* Bereich löschen */}
-                <div className="mt-3 pt-3 border-t border-border/50">
-                  <p className="text-xs text-muted-foreground mb-2">Bereich löschen:</p>
-                  <div className="flex gap-2 items-center mb-2">
-                    <Input
-                      type="number"
-                      min={1}
-                      max={images.length}
-                      placeholder="Von"
-                      className="text-sm w-20"
-                      id="delete-from"
-                    />
-                    <span className="text-muted-foreground">-</span>
-                    <Input
-                      type="number"
-                      min={1}
-                      max={images.length}
-                      placeholder="Bis"
-                      className="text-sm w-20"
-                      id="delete-to"
+              </Card>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+                {/* Canvas Area */}
+                <Card className="lg:col-span-3 p-6 bg-canvas-bg">
+                  {/* Quick Labels with Keyboard Shortcuts */}
+                  <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm text-muted-foreground">
+                        Bild {currentIndex + 1} von {images.length}
+                      </span>
+                      {selectedImages.has(currentIndex) && (
+                        <span className="text-xs bg-destructive/20 text-destructive px-2 py-0.5 rounded-full font-medium">
+                          ✓ Markiert
+                        </span>
+                      )}
+                    </div>
+                    
+                    {/* Quick Label Buttons */}
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-1">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs px-2 font-bold"
+                          onClick={() => applyQuickLabel(quickLabelF)}
+                        >
+                          <span className="bg-primary/20 text-primary px-1 rounded mr-1">F</span>
+                          {quickLabelF}
+                        </Button>
+                        <select
+                          value={quickLabelF}
+                          onChange={(e) => setQuickLabelF(e.target.value)}
+                          className="h-7 w-6 rounded border border-input bg-background text-xs cursor-pointer"
+                          title="F-Taste ändern"
+                        >
+                          {activityLabels.map(label => (
+                            <option key={label} value={label}>{label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      
+                      <div className="flex items-center gap-1">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs px-2 font-bold"
+                          onClick={() => applyQuickLabel(quickLabelG)}
+                        >
+                          <span className="bg-primary/20 text-primary px-1 rounded mr-1">G</span>
+                          {quickLabelG}
+                        </Button>
+                        <select
+                          value={quickLabelG}
+                          onChange={(e) => setQuickLabelG(e.target.value)}
+                          className="h-7 w-6 rounded border border-input bg-background text-xs cursor-pointer"
+                          title="G-Taste ändern"
+                        >
+                          {activityLabels.map(label => (
+                            <option key={label} value={label}>{label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      
+                      <div className="flex items-center gap-1">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs px-2 font-bold"
+                          onClick={() => applyQuickLabel(quickLabelH)}
+                        >
+                          <span className="bg-primary/20 text-primary px-1 rounded mr-1">H</span>
+                          {quickLabelH}
+                        </Button>
+                        <select
+                          value={quickLabelH}
+                          onChange={(e) => setQuickLabelH(e.target.value)}
+                          className="h-7 w-6 rounded border border-input bg-background text-xs cursor-pointer"
+                          title="H-Taste ändern"
+                        >
+                          {activityLabels.map(label => (
+                            <option key={label} value={label}>{label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      
+                      <span className="text-xs text-muted-foreground mx-2">|</span>
+                      {selectedImages.size > 0 && (
+                        <span className="text-xs text-muted-foreground">
+                          {selectedImages.size} markiert
+                        </span>
+                      )}
+                      <span className="text-sm text-primary font-medium">
+                        {currentImage.detections.length} Erkennungen
+                      </span>
+                    </div>
+                  </div>
+                  
+                  <div ref={containerRef} className="relative bg-black/20 rounded-lg overflow-hidden">
+                    <canvas
+                      ref={canvasRef}
+                      className="max-w-full h-auto mx-auto"
+                      style={{ cursor: getCursorStyle() }}
+                      onMouseDown={handleCanvasMouseDown}
+                      onMouseMove={handleCanvasMouseMove}
+                      onMouseUp={handleCanvasMouseUp}
+                      onMouseLeave={handleCanvasMouseUp}
                     />
                   </div>
-                  <Button
-                    size="sm"
-                    variant="destructive"
-                    className="w-full"
-                    onClick={() => {
-                      const fromInput = document.getElementById('delete-from') as HTMLInputElement;
-                      const toInput = document.getElementById('delete-to') as HTMLInputElement;
-                      
-                      const from = parseInt(fromInput.value) - 1;
-                      const to = parseInt(toInput.value) - 1;
-                      
-                      if (isNaN(from) || isNaN(to)) {
-                        toast.error("Bitte Bereich eingeben (Von - Bis)");
-                        return;
-                      }
-                      if (from < 0 || to >= images.length || from > to) {
-                        toast.error(`Ungültiger Bereich. Muss zwischen 1 und ${images.length} sein.`);
-                        return;
-                      }
-                      
-                      const newImages = [...images];
-                      const deleteCount = to - from + 1;
-                      newImages.splice(from, deleteCount);
-                      setImages(newImages);
-                      
-                      // Setze aktuellen Index zurück falls nötig
-                      if (currentIndex >= newImages.length) {
-                        setCurrentIndex(Math.max(0, newImages.length - 1));
-                      }
-                      setSelectedDetection(null);
-                      
-                      // Felder zurücksetzen
-                      fromInput.value = '';
-                      toInput.value = '';
-                      
-                      toast.success(`${deleteCount} Bilder gelöscht`);
-                    }}
-                  >
-                    <Trash2 className="w-3 h-3 mr-1" />
-                    Bereich löschen
-                  </Button>
-                </div>
-              </div>
 
-              {/* Quick Activity Labels */}
-              <div className="pb-4 border-b border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2">
-                  <Sparkles className="w-4 h-4" />
-                  Schnell-Labels (Tätigkeiten)
-                </h3>
-                <div className="flex flex-wrap gap-1">
-                  {activityLabels.map((label) => (
+                  {/* Navigation */}
+                  <div className="flex items-center justify-between mt-6">
                     <Button
-                      key={label}
-                      size="sm"
-                      variant="outline"
-                      className="text-xs h-7 px-2"
-                      disabled={selectedDetection === null}
-                      onClick={() => {
-                        if (selectedDetection !== null) {
-                          const newImages = [...images];
-                          newImages[currentIndex].detections[selectedDetection].label = label;
-                          setImages(newImages);
-                          toast.success(`Label auf "${label}" geändert`);
-                        }
-                      }}
-                    >
-                      {label}
-                    </Button>
-                  ))}
-                </div>
-                {selectedDetection === null && (
-                  <p className="text-xs text-muted-foreground mt-2">
-                    Wähle zuerst eine Box aus, um ein Schnell-Label zuzuweisen
-                  </p>
-                )}
-                
-                {/* Custom Label hinzufügen */}
-                <div className="mt-3 pt-3 border-t border-border/50">
-                  <p className="text-xs text-muted-foreground mb-2">Eigenes Label hinzufügen:</p>
-                  <div className="flex gap-2">
-                    <Input
-                      value={newCustomLabel}
-                      onChange={(e) => setNewCustomLabel(e.target.value)}
-                      placeholder="Neues Label..."
-                      className="text-sm h-7"
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' && newCustomLabel.trim()) {
-                          if (!activityLabels.includes(newCustomLabel.trim())) {
-                            setCustomActivityLabels(prev => [...prev, newCustomLabel.trim()]);
-                            toast.success(`Label "${newCustomLabel.trim()}" hinzugefügt`);
-                          } else {
-                            toast.error("Label existiert bereits");
-                          }
-                          setNewCustomLabel("");
-                        }
-                      }}
-                    />
-                    <Button
-                      size="sm"
+                      onClick={handlePrevious}
+                      disabled={currentIndex === 0}
                       variant="secondary"
-                      className="h-7 px-2"
-                      onClick={() => {
-                        if (newCustomLabel.trim()) {
-                          if (!activityLabels.includes(newCustomLabel.trim())) {
-                            setCustomActivityLabels(prev => [...prev, newCustomLabel.trim()]);
-                            toast.success(`Label "${newCustomLabel.trim()}" hinzugefügt`);
-                          } else {
-                            toast.error("Label existiert bereits");
-                          }
-                          setNewCustomLabel("");
-                        }
-                      }}
                     >
-                      +
+                      <ChevronLeft className="w-4 h-4 mr-2" />
+                      Zurück (A)
+                    </Button>
+                    
+                    <div className="text-center">
+                      <span className="text-sm text-muted-foreground">
+                        {currentImage.file.name}
+                      </span>
+                      {currentImage.sourceVideo && (
+                        <span className="block text-xs text-primary mt-1">
+                          <Film className="w-3 h-3 inline mr-1" />
+                          Frame {(currentImage.frameNumber ?? 0)} aus {currentImage.sourceVideo}
+                        </span>
+                      )}
+                    </div>
+                    
+                    <Button
+                      onClick={handleNext}
+                      disabled={currentIndex === images.length - 1}
+                      variant="default"
+                    >
+                      Weiter (D)
+                      <ChevronRight className="w-4 h-4 ml-2" />
                     </Button>
                   </div>
-                  {customActivityLabels.length > 0 && (
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      {customActivityLabels.map((label, idx) => (
-                        <span 
-                          key={idx} 
-                          className="text-xs bg-primary/20 text-primary px-2 py-1 rounded flex items-center gap-1"
+                </Card>
+
+                {/* Sidebar */}
+                <Card className="p-6 space-y-4">
+                  {/* Auto Label Settings */}
+                  <div className="pb-4 border-b border-border">
+                    <h3 className="font-semibold mb-3 flex items-center gap-2">
+                      <SlidersHorizontal className="w-4 h-4" />
+                      Auto-Label Einstellungen
+                    </h3>
+                    <div className="space-y-3">
+                      <div>
+                        <div className="flex justify-between text-sm mb-2">
+                          <span className="text-muted-foreground">Konfidenz-Schwellenwert</span>
+                          <span className="font-medium">{(confidenceThreshold * 100).toFixed(0)}%</span>
+                        </div>
+                        <Slider
+                          value={[confidenceThreshold]}
+                          onValueChange={([v]) => setConfidenceThreshold(v)}
+                          min={0.1}
+                          max={0.95}
+                          step={0.05}
+                        />
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        className="w-full"
+                        onClick={handleRedetect}
+                        disabled={isProcessing || !model}
+                      >
+                        Neu erkennen
+                      </Button>
+                    </div>
+                  </div>
+
+                  {/* Batch Labeling */}
+                  <div className="pb-4 border-b border-border">
+                    <h3 className="font-semibold mb-3 flex items-center gap-2">
+                      <Tag className="w-4 h-4" />
+                      Batch-Labeling
+                    </h3>
+                    <div className="space-y-2">
+                      <div className="flex gap-2 items-center">
+                        <Input
+                          type="number"
+                          min={1}
+                          max={images.length}
+                          placeholder="Von"
+                          className="text-sm w-16"
+                          id="batch-from"
+                          defaultValue={1}
+                        />
+                        <span className="text-muted-foreground">-</span>
+                        <Input
+                          type="number"
+                          min={1}
+                          max={images.length}
+                          placeholder="Bis"
+                          className="text-sm w-16"
+                          id="batch-to"
+                          defaultValue={images.length}
+                        />
+                      </div>
+                      <select
+                        id="batch-label-select"
+                        className="w-full h-8 rounded border border-input bg-background text-sm px-2"
+                      >
+                        <option value="">Label wählen...</option>
+                        {activityLabels.map((label) => (
+                          <option key={label} value={label}>{label}</option>
+                        ))}
+                      </select>
+                      <Button
+                        size="sm"
+                        className="w-full"
+                        disabled={isProcessing || !model}
+                        onClick={async () => {
+                          const fromInput = document.getElementById('batch-from') as HTMLInputElement;
+                          const toInput = document.getElementById('batch-to') as HTMLInputElement;
+                          const labelSelect = document.getElementById('batch-label-select') as HTMLSelectElement;
+                          
+                          const from = parseInt(fromInput.value) - 1; // Convert to 0-indexed
+                          const to = parseInt(toInput.value) - 1;
+                          const label = labelSelect.value;
+                          
+                          if (isNaN(from) || isNaN(to)) {
+                            toast.error("Bitte Bereich eingeben (Von - Bis)");
+                            return;
+                          }
+                          if (!label) {
+                            toast.error("Bitte Label auswählen");
+                            return;
+                          }
+                          if (from < 0 || to >= images.length || from > to) {
+                            toast.error(`Ungültiger Bereich. Muss zwischen 1 und ${images.length} sein.`);
+                            return;
+                          }
+                          
+                          setIsProcessing(true);
+                          const newImages = [...images];
+                          let detectedCount = 0;
+                          
+                          for (let i = from; i <= to; i++) {
+                            // Wenn keine Detektionen vorhanden, führe Personen-Erkennung durch
+                            if (newImages[i].detections.length === 0 && model) {
+                              const detections = await detectObjects(newImages[i].file, confidenceThreshold);
+                              // Nur "Person" Detektionen behalten und mit dem Label versehen
+                              const personDetections = detections
+                                .filter(d => d.label.toLowerCase() === 'person')
+                                .map(d => ({ ...d, label }));
+                              newImages[i].detections = personDetections;
+                              if (personDetections.length > 0) detectedCount++;
+                            } else {
+                              // Bestehende Detektionen nur umbenennen
+                              newImages[i].detections = newImages[i].detections.map(d => ({
+                                ...d,
+                                label: label
+                              }));
+                            }
+                          }
+                          
+                          setImages(newImages);
+                          setIsProcessing(false);
+                          toast.success(`Bilder ${from + 1}-${to + 1} auf "${label}" gesetzt (${to - from + 1} Bilder, ${detectedCount} neu erkannt)`);
+                        }}
+                      >
+                        {isProcessing ? (
+                          <>
+                            <Loader2 className="w-3 h-3 animate-spin mr-1" />
+                            Erkenne Personen...
+                          </>
+                        ) : (
+                          "Bereich labeln"
+                        )}
+                      </Button>
+                    </div>
+                    
+                    {/* Quick range buttons */}
+                    <div className="mt-3 pt-3 border-t border-border/50">
+                      <p className="text-xs text-muted-foreground mb-2">Schnell-Bereiche:</p>
+                      <div className="flex flex-wrap gap-1">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="text-xs h-6 px-2"
+                          onClick={() => {
+                            const fromInput = document.getElementById('batch-from') as HTMLInputElement;
+                            const toInput = document.getElementById('batch-to') as HTMLInputElement;
+                            fromInput.value = "1";
+                            toInput.value = String(Math.min(50, images.length));
+                          }}
+                        >
+                          1-50
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="text-xs h-6 px-2"
+                          onClick={() => {
+                            const fromInput = document.getElementById('batch-from') as HTMLInputElement;
+                            const toInput = document.getElementById('batch-to') as HTMLInputElement;
+                            fromInput.value = "51";
+                            toInput.value = String(Math.min(100, images.length));
+                          }}
+                        >
+                          51-100
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="text-xs h-6 px-2"
+                          onClick={() => {
+                            const fromInput = document.getElementById('batch-from') as HTMLInputElement;
+                            const toInput = document.getElementById('batch-to') as HTMLInputElement;
+                            fromInput.value = String(currentIndex + 1);
+                            toInput.value = String(images.length);
+                          }}
+                        >
+                          Ab hier
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="text-xs h-6 px-2"
+                          onClick={() => {
+                            const fromInput = document.getElementById('batch-from') as HTMLInputElement;
+                            const toInput = document.getElementById('batch-to') as HTMLInputElement;
+                            fromInput.value = "1";
+                            toInput.value = String(images.length);
+                          }}
+                        >
+                          Alle
+                        </Button>
+                      </div>
+                    </div>
+                    
+                    {/* Bilder markieren und löschen */}
+                    <div className="mt-3 pt-3 border-t border-border/50">
+                      <p className="text-xs text-muted-foreground mb-2">
+                        Bilder markieren & löschen ({selectedImages.size} ausgewählt)
+                      </p>
+                      <div className="flex gap-2 mb-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="flex-1 text-xs"
+                          onClick={() => {
+                            // Aktuelles Bild zur Auswahl hinzufügen/entfernen
+                            const newSelection = new Set(selectedImages);
+                            if (newSelection.has(currentIndex)) {
+                              newSelection.delete(currentIndex);
+                            } else {
+                              newSelection.add(currentIndex);
+                            }
+                            setSelectedImages(newSelection);
+                          }}
+                        >
+                          {selectedImages.has(currentIndex) ? "Demarkieren" : "Markieren"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="flex-1 text-xs"
+                          onClick={() => {
+                            // Alle markieren
+                            const allSelected = new Set<number>();
+                            images.forEach((_, idx) => allSelected.add(idx));
+                            setSelectedImages(allSelected);
+                          }}
+                        >
+                          Alle
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="flex-1 text-xs"
+                          onClick={() => setSelectedImages(new Set())}
+                        >
+                          Keine
+                        </Button>
+                      </div>
+                      
+                      {/* Bereich markieren */}
+                      <div className="flex gap-2 items-center mb-2">
+                        <Input
+                          type="number"
+                          min={1}
+                          max={images.length}
+                          placeholder="Von"
+                          className="text-sm w-16"
+                          id="select-from"
+                        />
+                        <span className="text-muted-foreground text-xs">-</span>
+                        <Input
+                          type="number"
+                          min={1}
+                          max={images.length}
+                          placeholder="Bis"
+                          className="text-sm w-16"
+                          id="select-to"
+                        />
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="text-xs"
+                          onClick={() => {
+                            const fromInput = document.getElementById('select-from') as HTMLInputElement;
+                            const toInput = document.getElementById('select-to') as HTMLInputElement;
+                            const from = parseInt(fromInput.value) - 1;
+                            const to = parseInt(toInput.value) - 1;
+                            
+                            if (isNaN(from) || isNaN(to) || from < 0 || to >= images.length || from > to) {
+                              toast.error(`Ungültiger Bereich (1-${images.length})`);
+                              return;
+                            }
+                            
+                            const newSelection = new Set(selectedImages);
+                            for (let i = from; i <= to; i++) {
+                              newSelection.add(i);
+                            }
+                            setSelectedImages(newSelection);
+                            fromInput.value = '';
+                            toInput.value = '';
+                            toast.success(`${to - from + 1} Bilder markiert`);
+                          }}
+                        >
+                          Bereich
+                        </Button>
+                      </div>
+                      
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        className="w-full"
+                        disabled={selectedImages.size === 0}
+                        onClick={() => {
+                          if (selectedImages.size === 0) {
+                            toast.error("Keine Bilder markiert");
+                            return;
+                          }
+                          
+                          const deleteCount = selectedImages.size;
+                          const newImages = images.filter((_, idx) => !selectedImages.has(idx));
+                          setImages(newImages);
+                          
+                          // Setze aktuellen Index zurück falls nötig
+                          if (currentIndex >= newImages.length) {
+                            setCurrentIndex(Math.max(0, newImages.length - 1));
+                          }
+                          setSelectedDetection(null);
+                          setSelectedImages(new Set());
+                          
+                          toast.success(`${deleteCount} markierte Bilder gelöscht`);
+                        }}
+                      >
+                        <Trash2 className="w-3 h-3 mr-1" />
+                        {selectedImages.size} markierte löschen
+                      </Button>
+                    </div>
+                  </div>
+
+                  {/* Quick Activity Labels */}
+                  <div className="pb-4 border-b border-border">
+                    <h3 className="font-semibold mb-3 flex items-center gap-2">
+                      <Sparkles className="w-4 h-4" />
+                      Schnell-Labels (Tätigkeiten)
+                    </h3>
+                    <div className="flex flex-wrap gap-1">
+                      {activityLabels.map((label) => (
+                        <Button
+                          key={label}
+                          size="sm"
+                          variant="outline"
+                          className="text-xs h-7 px-2"
+                          disabled={selectedDetection === null}
+                          onClick={() => {
+                            if (selectedDetection !== null) {
+                              const newImages = [...images];
+                              newImages[currentIndex].detections[selectedDetection].label = label;
+                              setImages(newImages);
+                              toast.success(`Label auf "${label}" geändert`);
+                            }
+                          }}
                         >
                           {label}
-                          <button
-                            onClick={() => {
-                              setCustomActivityLabels(prev => prev.filter((_, i) => i !== idx));
-                              toast.success(`Label "${label}" entfernt`);
-                            }}
-                            className="hover:text-destructive"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
-                        </span>
+                        </Button>
                       ))}
                     </div>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                <h3 className="font-semibold mb-3">Erkannte Objekte</h3>
-                <div className="space-y-2 max-h-64 overflow-y-auto">
-                  {currentImage.detections.map((detection, idx) => (
-                    <div
-                      key={idx}
-                      onClick={() => {
-                        setSelectedDetection(idx);
-                        setEditingLabel(null);
-                      }}
-                      className={`p-3 rounded-lg text-sm cursor-pointer transition-colors ${
-                        idx === selectedDetection 
-                          ? "bg-primary/20 border border-primary" 
-                          : "bg-secondary hover:bg-secondary/80"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        {editingLabel === idx ? (
-                          <div className="flex items-center gap-1 flex-1">
-                            <Input
-                              value={editLabelValue}
-                              onChange={(e) => setEditLabelValue(e.target.value)}
-                              className="h-6 text-xs"
-                              autoFocus
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') {
-                                  const newImages = [...images];
-                                  newImages[currentIndex].detections[idx].label = editLabelValue;
-                                  setImages(newImages);
-                                  setEditingLabel(null);
-                                  toast.success(`Label geändert`);
-                                } else if (e.key === 'Escape') {
-                                  setEditingLabel(null);
-                                }
-                              }}
-                              onClick={(e) => e.stopPropagation()}
-                            />
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-6 w-6 p-0 text-green-600"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                const newImages = [...images];
-                                newImages[currentIndex].detections[idx].label = editLabelValue;
-                                setImages(newImages);
-                                setEditingLabel(null);
-                                toast.success(`Label geändert`);
-                              }}
-                            >
-                              <Check className="w-3 h-3" />
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-6 w-6 p-0"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setEditingLabel(null);
-                              }}
-                            >
-                              <X className="w-3 h-3" />
-                            </Button>
-                          </div>
-                        ) : (
-                          <>
-                            <div className="font-medium text-foreground flex-1">
-                              {detection.label}
-                            </div>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-6 w-6 p-0"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setEditingLabel(idx);
-                                setEditLabelValue(detection.label);
-                              }}
-                            >
-                              <Pencil className="w-3 h-3" />
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-6 w-6 p-0 text-destructive hover:text-destructive"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleDeleteDetection(idx);
-                              }}
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </Button>
-                          </>
-                        )}
+                    {selectedDetection === null && (
+                      <p className="text-xs text-muted-foreground mt-2">
+                        Wähle zuerst eine Box aus, um ein Schnell-Label zuzuweisen
+                      </p>
+                    )}
+                    
+                    {/* Custom Label hinzufügen */}
+                    <div className="mt-3 pt-3 border-t border-border/50">
+                      <p className="text-xs text-muted-foreground mb-2">Eigenes Label hinzufügen:</p>
+                      <div className="flex gap-2">
+                        <Input
+                          value={newCustomLabel}
+                          onChange={(e) => setNewCustomLabel(e.target.value)}
+                          placeholder="Neues Label..."
+                          className="text-sm h-7"
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && newCustomLabel.trim()) {
+                              if (!activityLabels.includes(newCustomLabel.trim())) {
+                                setCustomActivityLabels(prev => [...prev, newCustomLabel.trim()]);
+                                toast.success(`Label "${newCustomLabel.trim()}" hinzugefügt`);
+                              } else {
+                                toast.error("Label existiert bereits");
+                              }
+                              setNewCustomLabel("");
+                            }
+                          }}
+                        />
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          className="h-7 px-2"
+                          onClick={() => {
+                            if (newCustomLabel.trim()) {
+                              if (!activityLabels.includes(newCustomLabel.trim())) {
+                                setCustomActivityLabels(prev => [...prev, newCustomLabel.trim()]);
+                                toast.success(`Label "${newCustomLabel.trim()}" hinzugefügt`);
+                              } else {
+                                toast.error("Label existiert bereits");
+                              }
+                              setNewCustomLabel("");
+                            }
+                          }}
+                        >
+                          +
+                        </Button>
                       </div>
-                      <div className="text-muted-foreground text-xs mt-1">
-                        Konfidenz: {(detection.confidence * 100).toFixed(0)}%
+                      {customActivityLabels.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {customActivityLabels.map((label, idx) => (
+                            <span 
+                              key={idx} 
+                              className="text-xs bg-primary/20 text-primary px-2 py-1 rounded flex items-center gap-1"
+                            >
+                              {label}
+                              <button
+                                onClick={() => {
+                                  setCustomActivityLabels(prev => prev.filter((_, i) => i !== idx));
+                                  toast.success(`Label "${label}" entfernt`);
+                                }}
+                                className="hover:text-destructive"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div>
+                    <h3 className="font-semibold mb-3">Erkannte Objekte</h3>
+                    <div className="space-y-2 max-h-64 overflow-y-auto">
+                      {currentImage.detections.map((detection, idx) => (
+                        <div
+                          key={idx}
+                          onClick={() => {
+                            setSelectedDetection(idx);
+                            setEditingLabel(null);
+                          }}
+                          className={`p-3 rounded-lg text-sm cursor-pointer transition-colors ${
+                            idx === selectedDetection 
+                              ? "bg-primary/20 border border-primary" 
+                              : "bg-secondary hover:bg-secondary/80"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            {editingLabel === idx ? (
+                              <div className="flex items-center gap-1 flex-1">
+                                <Input
+                                  value={editLabelValue}
+                                  onChange={(e) => setEditLabelValue(e.target.value)}
+                                  className="h-6 text-xs"
+                                  autoFocus
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      const newImages = [...images];
+                                      newImages[currentIndex].detections[idx].label = editLabelValue;
+                                      setImages(newImages);
+                                      setEditingLabel(null);
+                                      toast.success(`Label geändert`);
+                                    } else if (e.key === 'Escape') {
+                                      setEditingLabel(null);
+                                    }
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 w-6 p-0 text-green-600"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const newImages = [...images];
+                                    newImages[currentIndex].detections[idx].label = editLabelValue;
+                                    setImages(newImages);
+                                    setEditingLabel(null);
+                                    toast.success(`Label geändert`);
+                                  }}
+                                >
+                                  <Check className="w-3 h-3" />
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 w-6 p-0"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingLabel(null);
+                                  }}
+                                >
+                                  <X className="w-3 h-3" />
+                                </Button>
+                              </div>
+                            ) : (
+                              <>
+                                <div className="font-medium text-foreground flex-1">
+                                  {detection.label}
+                                </div>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 w-6 p-0"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingLabel(idx);
+                                    setEditLabelValue(detection.label);
+                                  }}
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 w-6 p-0 text-destructive hover:text-destructive"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteDetection(idx);
+                                  }}
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </Button>
+                              </>
+                            )}
+                          </div>
+                          <div className="text-muted-foreground text-xs mt-1">
+                            Konfidenz: {(detection.confidence * 100).toFixed(0)}%
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="pt-4 border-t border-border">
+                    <h3 className="font-semibold mb-2 text-sm">Tastenkürzel</h3>
+                    <div className="space-y-2 text-xs text-muted-foreground">
+                      <div className="flex justify-between">
+                        <span>Nächstes Bild:</span>
+                        <kbd className="px-2 py-1 bg-muted rounded">D</kbd>
+                      </div>
+                      <div className="flex justify-between">
+                        <span>Vorheriges Bild:</span>
+                        <kbd className="px-2 py-1 bg-muted rounded">A</kbd>
+                      </div>
+                      <div className="flex justify-between">
+                        <span>Löschen:</span>
+                        <kbd className="px-2 py-1 bg-muted rounded">Entf</kbd>
+                      </div>
+                      <div className="flex justify-between">
+                        <span>Abwählen:</span>
+                        <kbd className="px-2 py-1 bg-muted rounded">Esc</kbd>
                       </div>
                     </div>
-                  ))}
-                </div>
+                  </div>
+                  
+                  {selectedDetection !== null && (
+                    <div className="pt-4 border-t border-border">
+                      <p className="text-xs text-muted-foreground">
+                        Klicke auf ✏️ um das Label zu ändern, oder wähle ein Schnell-Label oben.
+                      </p>
+                    </div>
+                  )}
+                </Card>
               </div>
-
-              <div className="pt-4 border-t border-border">
-                <h3 className="font-semibold mb-2 text-sm">Tastenkürzel</h3>
-                <div className="space-y-2 text-xs text-muted-foreground">
-                  <div className="flex justify-between">
-                    <span>Nächstes Bild:</span>
-                    <kbd className="px-2 py-1 bg-muted rounded">D</kbd>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Vorheriges Bild:</span>
-                    <kbd className="px-2 py-1 bg-muted rounded">A</kbd>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Löschen:</span>
-                    <kbd className="px-2 py-1 bg-muted rounded">Entf</kbd>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Abwählen:</span>
-                    <kbd className="px-2 py-1 bg-muted rounded">Esc</kbd>
-                  </div>
-                </div>
-              </div>
-              
-              {selectedDetection !== null && (
-                <div className="pt-4 border-t border-border">
-                  <p className="text-xs text-muted-foreground">
-                    Klicke auf ✏️ um das Label zu ändern, oder wähle ein Schnell-Label oben.
-                  </p>
-                </div>
-              )}
-            </Card>
-          </div>
-        )}
+            )}
+          </TabsContent>
+        </Tabs>
       </div>
     </div>
   );
