@@ -10,6 +10,7 @@ import * as cocoSsd from "@tensorflow-models/coco-ssd";
 import * as tf from "@tensorflow/tfjs";
 import "@tensorflow/tfjs-backend-webgpu";
 import JSZip from "jszip";
+import { ManualClipEditor } from "./ManualClipEditor";
 
 
 interface Detection {
@@ -1190,6 +1191,227 @@ export const ImageAnnotator = () => {
     toast.success("Bilder zurückgesetzt!");
   };
 
+  // Export annotated clips grouped by clip name
+  // Structure: {ClipName}/Labeled/00001.jpg, ..., annotations.json
+  //            {ClipName}/Unlabeled/00001.jpg, ...
+  const handleExportAnnotatedClips = async () => {
+    const zip = new JSZip();
+
+    // Default labels that should NOT be exported (COCO-SSD labels)
+    const cocoLabels = new Set(
+      [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+        "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+        "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+        "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+        "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+        "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+        "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
+        "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book",
+        "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
+      ].map((l) => l.toLowerCase())
+    );
+
+    // Windows-safe path segment
+    const toSafePathSegment = (name: string) =>
+      name
+        .trim()
+        .replace(/\\/g, "＼")
+        .replace(/\//g, "／")
+        .replace(/:/g, "：")
+        .replace(/\*/g, "＊")
+        .replace(/\?/g, "？")
+        .replace(/"/g, "＂")
+        .replace(/</g, "＜")
+        .replace(/>/g, "＞")
+        .replace(/\|/g, "｜")
+        .replace(/\.mp4$/i, "")
+        .replace(/\.avi$/i, "")
+        .replace(/\.mov$/i, "")
+        .replace(/\.mkv$/i, "")
+        .replace(/\.webm$/i, "");
+
+    // Helper to get custom label from detections (non-COCO labels)
+    const getCustomLabel = (img: ImageData): string | null => {
+      for (const det of img.detections) {
+        const label = (det.label ?? "").trim();
+        if (label && !cocoLabels.has(label.toLowerCase())) {
+          return label;
+        }
+      }
+      return null;
+    };
+
+    // Get all non-deleted images (exclude marked ones)
+    const validImages = images
+      .map((img, idx) => ({ img, idx }))
+      .filter(({ idx }) => !selectedImages.has(idx));
+
+    if (validImages.length === 0) {
+      toast.error("Keine Frames zum Exportieren (alle markiert oder keine vorhanden)");
+      return;
+    }
+
+    // Group by clip name (sourceVideo) and find dominant label per clip
+    const byClip = new Map<string, { img: ImageData; idx: number }[]>();
+    for (const item of validImages) {
+      const clipKey = (item.img.sourceVideo ?? "ungrouped").trim() || "ungrouped";
+      if (!byClip.has(clipKey)) byClip.set(clipKey, []);
+      byClip.get(clipKey)!.push(item);
+    }
+
+    let totalExportedFrames = 0;
+    let totalExportedClips = 0;
+
+    // Counter for clips with same label name
+    const labelCounter = new Map<string, number>();
+
+    for (const [clipSourceVideo, clipItems] of byClip) {
+      // Sort frames within clip
+      clipItems.sort((a, b) => {
+        const fa = a.img.frameNumber ?? 0;
+        const fb = b.img.frameNumber ?? 0;
+        if (fa !== fb) return fa - fb;
+        return a.img.file.name.localeCompare(b.img.file.name);
+      });
+
+      // Separate labeled and unlabeled frames
+      const labeledFrames: ImageData[] = [];
+      const unlabeledFrames: ImageData[] = [];
+
+      for (const { img } of clipItems) {
+        const label = getCustomLabel(img);
+        if (label) {
+          labeledFrames.push(img);
+        } else {
+          unlabeledFrames.push(img);
+        }
+      }
+
+      // Determine folder name: use the dominant custom label or fallback to sourceVideo
+      let folderLabel = "Unlabeled_Clip";
+      
+      if (labeledFrames.length > 0) {
+        // Count labels to find dominant one
+        const labelCounts = new Map<string, number>();
+        for (const img of labeledFrames) {
+          const label = getCustomLabel(img);
+          if (label) {
+            labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+          }
+        }
+        // Find most frequent label
+        let maxCount = 0;
+        for (const [label, count] of labelCounts) {
+          if (count > maxCount) {
+            maxCount = count;
+            folderLabel = label;
+          }
+        }
+      }
+
+      // Add counter suffix if same label appears multiple times
+      const currentCount = (labelCounter.get(folderLabel) || 0) + 1;
+      labelCounter.set(folderLabel, currentCount);
+      const clipFolderName = currentCount > 1 ? `${folderLabel}${currentCount}` : folderLabel;
+
+      const safeClipName = toSafePathSegment(clipFolderName);
+      const clipFolder = zip.folder(safeClipName);
+      if (!clipFolder) continue;
+
+      // Export labeled frames as individual JSON files
+      if (labeledFrames.length > 0) {
+        const labeledFolder = clipFolder.folder("Labeled");
+        if (labeledFolder) {
+          let frameCounter = 0;
+          for (const img of labeledFrames) {
+            frameCounter++;
+            const jsonFileName = `${String(frameCounter).padStart(5, "0")}.json`;
+
+            const frameLabel = getCustomLabel(img);
+            const customDetections = img.detections.filter((d) => {
+              const l = (d.label ?? "").trim();
+              if (!l) return false;
+              return !cocoLabels.has(l.toLowerCase());
+            });
+
+            const dims = await new Promise<{ width: number | null; height: number | null }>((resolve) => {
+              const imgElement = new Image();
+              imgElement.src = img.url;
+              imgElement.onload = () => resolve({ width: imgElement.width, height: imgElement.height });
+              imgElement.onerror = () => resolve({ width: null, height: null });
+            });
+
+            const frameData = {
+              width: dims.width,
+              height: dims.height,
+              sourceVideo: img.sourceVideo ?? null,
+              frameNumber: img.frameNumber ?? null,
+              activityLabel: frameLabel,
+              annotations: customDetections.map((det) => ({
+                label: det.label,
+                x: Math.round(det.x),
+                y: Math.round(det.y),
+                width: Math.round(det.width),
+                height: Math.round(det.height),
+                confidence: det.confidence,
+              })),
+            };
+
+            labeledFolder.file(jsonFileName, JSON.stringify(frameData, null, 2));
+            totalExportedFrames++;
+          }
+        }
+      }
+
+      // Export unlabeled frames
+      if (unlabeledFrames.length > 0) {
+        const unlabeledFolder = clipFolder.folder("Unlabeled");
+        if (unlabeledFolder) {
+          let frameCounter = 0;
+          for (const img of unlabeledFrames) {
+            frameCounter++;
+            const newFileName = `${String(frameCounter).padStart(5, "0")}.jpg`;
+
+            const response = await fetch(img.url);
+            const blob = await response.blob();
+            unlabeledFolder.file(newFileName, blob);
+
+            totalExportedFrames++;
+          }
+        }
+      }
+
+      // Add clip.json with metadata
+      clipFolder.file(
+        "clip.json",
+        JSON.stringify(
+          {
+            clip: clipFolderName,
+            sourceVideo: clipSourceVideo,
+            labeledFrames: labeledFrames.length,
+            unlabeledFrames: unlabeledFrames.length,
+            totalFrames: labeledFrames.length + unlabeledFrames.length,
+          },
+          null,
+          2
+        )
+      );
+
+      totalExportedClips++;
+    }
+
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "clips_export.zip";
+    a.click();
+
+    toast.success(`Export: ${totalExportedClips} Clips, ${totalExportedFrames} Frames`);
+  };
+
   // Export structure (exact as requested):
   // {LabelName}/
   //   {LabelName}_labeled/{LabelName}01.json
@@ -1519,6 +1741,16 @@ export const ImageAnnotator = () => {
                 </div>
               )}
             </Card>
+
+            {/* Manual Clip Editor */}
+            <ManualClipEditor
+              framesPerClip={framesPerClip}
+              frameInterval={clipFrameInterval}
+              onClipsCreated={(newClips) => {
+                setClips(prev => [...prev, ...newClips]);
+                toast.success(`${newClips.length} manuelle Clips hinzugefügt!`);
+              }}
+            />
           </TabsContent>
 
           {/* ==================== ANNOTATOR TAB ==================== */}
@@ -1560,9 +1792,9 @@ export const ImageAnnotator = () => {
               
               {images.length > 0 && (
                 <>
-                  <Button onClick={handleExport} variant="default">
+                  <Button onClick={handleExportAnnotatedClips} variant="default">
                     <Download className="w-4 h-4 mr-2" />
-                    Exportieren
+                    Export
                   </Button>
                   <Button onClick={handleReset} variant="ghost">
                     Zurücksetzen
