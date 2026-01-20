@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Slider } from "@/components/ui/slider";
-import { Play, Pause, Plus, Trash2, Scissors, Check, Video, ChevronLeft, ChevronRight, ZoomIn, ZoomOut } from "lucide-react";
+import { Play, Pause, Trash2, Scissors, Check, Video, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, X } from "lucide-react";
 import { toast } from "sonner";
 
 interface ClipMarker {
@@ -35,6 +35,9 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
   const [extractionProgress, setExtractionProgress] = useState(0);
   const [zoomLevel, setZoomLevel] = useState(1);
   const [timelineOffset, setTimelineOffset] = useState(0);
+  
+  // Pending marker start time for two-click marker creation
+  const [pendingMarkerStart, setPendingMarkerStart] = useState<number | null>(null);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
@@ -145,7 +148,7 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
     return `${mins.toString().padStart(2, "0")}:${secs.toFixed(1).padStart(4, "0")}`;
   };
 
-  // Handle timeline click
+  // Handle timeline click - TWO CLICK MARKER CREATION
   const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!timelineRef.current || duration === 0) return;
     const rect = timelineRef.current.getBoundingClientRect();
@@ -154,8 +157,43 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
     
     // Calculate time based on zoom and offset
     const visibleDuration = duration / zoomLevel;
-    const time = timelineOffset + ratio * visibleDuration;
-    seekTo(Math.max(0, Math.min(time, duration)));
+    const clickedTime = Math.max(0, Math.min(timelineOffset + ratio * visibleDuration, duration));
+    
+    // If no pending start, set this as start
+    if (pendingMarkerStart === null) {
+      setPendingMarkerStart(clickedTime);
+      seekTo(clickedTime);
+      toast.info(`Start gesetzt: ${formatTime(clickedTime)} - Klicke für Ende`);
+    } else {
+      // Second click - create marker
+      const startTime = Math.min(pendingMarkerStart, clickedTime);
+      const endTime = Math.max(pendingMarkerStart, clickedTime);
+      
+      if (endTime - startTime < 0.5) {
+        toast.error("Clip muss mindestens 0.5 Sekunden lang sein");
+        setPendingMarkerStart(null);
+        return;
+      }
+      
+      const newMarker: ClipMarker = {
+        id: Date.now().toString(),
+        startTime,
+        endTime,
+      };
+      
+      setMarkers(prev => [...prev, newMarker].sort((a, b) => a.startTime - b.startTime));
+      setPendingMarkerStart(null);
+      seekTo(endTime);
+      toast.success(`Clip erstellt: ${formatTime(startTime)} - ${formatTime(endTime)}`);
+    }
+  };
+  
+  // Cancel pending marker with Escape
+  const cancelPendingMarker = () => {
+    if (pendingMarkerStart !== null) {
+      setPendingMarkerStart(null);
+      toast.info("Marker-Erstellung abgebrochen");
+    }
   };
 
   // Calculate visible timeline range
@@ -400,7 +438,7 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
             
             <div
               ref={timelineRef}
-              className="relative h-20 bg-secondary rounded-lg cursor-crosshair overflow-hidden"
+              className={`relative h-20 rounded-lg cursor-crosshair overflow-hidden ${pendingMarkerStart !== null ? 'bg-primary/20 ring-2 ring-primary' : 'bg-secondary'}`}
               onClick={handleTimelineClick}
             >
               {/* Time markers */}
@@ -420,8 +458,20 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
                 })}
               </div>
 
+              {/* Pending marker start indicator */}
+              {pendingMarkerStart !== null && pendingMarkerStart >= visibleStart && pendingMarkerStart <= visibleEnd && (
+                <div
+                  className="absolute top-0 bottom-4 w-1 bg-primary z-20 animate-pulse"
+                  style={{ left: `${getTimelinePosition(pendingMarkerStart)}%` }}
+                >
+                  <div className="absolute -top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-primary rounded-full flex items-center justify-center">
+                    <span className="text-[8px] text-primary-foreground font-bold">S</span>
+                  </div>
+                </div>
+              )}
+
               {/* Clip markers */}
-              {markers.map((marker) => {
+              {markers.map((marker, idx) => {
                 const leftPos = getTimelinePosition(marker.startTime);
                 const rightPos = getTimelinePosition(marker.endTime);
                 const width = rightPos - leftPos;
@@ -444,7 +494,7 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
                     }}
                   >
                     <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-[10px] text-primary font-medium whitespace-nowrap">
-                      Clip
+                      Clip {idx + 1}
                     </span>
                   </div>
                 );
@@ -462,18 +512,29 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
             </div>
           </div>
 
-          {/* Add Marker Button */}
-          <div className="flex gap-3">
-            <Button onClick={addMarker} variant="outline" className="flex-1">
-              <Plus className="w-4 h-4 mr-2" />
-              Clip-Marker bei {formatTime(currentTime)}
-            </Button>
+          {/* Instructions & Actions */}
+          <div className="flex gap-3 items-center">
+            <div className="flex-1 text-sm text-muted-foreground">
+              {pendingMarkerStart !== null ? (
+                <span className="text-primary font-medium">
+                  ▶ Start bei {formatTime(pendingMarkerStart)} - Klicke auf Timeline für Ende
+                </span>
+              ) : (
+                <span>Klicke auf Timeline: 1. Klick = Start, 2. Klick = Ende</span>
+              )}
+            </div>
+            
+            {pendingMarkerStart !== null && (
+              <Button onClick={cancelPendingMarker} variant="outline" size="sm">
+                <X className="w-4 h-4 mr-1" />
+                Abbrechen
+              </Button>
+            )}
             
             {markers.length > 0 && (
               <Button
                 onClick={extractClipsFromMarkers}
-                disabled={isExtracting}
-                className="flex-1"
+                disabled={isExtracting || pendingMarkerStart !== null}
               >
                 {isExtracting ? (
                   <>Extrahiere... {extractionProgress}%</>

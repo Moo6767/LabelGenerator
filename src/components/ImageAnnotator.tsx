@@ -4,7 +4,7 @@ import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Upload, ChevronLeft, ChevronRight, Download, Trash2, Tag, Sparkles, SlidersHorizontal, Video, Film, Pencil, Check, X, Loader2, FolderOpen, Scissors } from "lucide-react";
+import { Upload, ChevronLeft, ChevronRight, Download, Trash2, Tag, Sparkles, SlidersHorizontal, Video, Film, Pencil, Check, X, Loader2, FolderOpen, Scissors, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import * as cocoSsd from "@tensorflow-models/coco-ssd";
 import * as tf from "@tensorflow/tfjs";
@@ -28,6 +28,8 @@ interface ImageData {
   detections: Detection[];
   frameNumber?: number;
   sourceVideo?: string;
+  /** Frame-/Aktivitätslabel (wird beim Export priorisiert) */
+  activityLabel?: string;
 }
 
 interface ClipData {
@@ -76,6 +78,24 @@ export const ImageAnnotator = () => {
   const [blurThreshold, setBlurThreshold] = useState(100); // Laplacian variance threshold
   const [chunkDuration, setChunkDuration] = useState(10); // Chunk duration in minutes (1-15)
   const [gpuBackend, setGpuBackend] = useState<string>("loading"); // Track which backend is active
+  
+  // Export settings
+  const [exportOnlyLabeled, setExportOnlyLabeled] = useState(true); // Only export labeled frames
+  
+  // Persistenter Clip-Zähler pro Label (für fortlaufende Nummerierung über Videos hinweg)
+  const [labelClipCounters, setLabelClipCounters] = useState<Record<string, number>>(() => {
+    try {
+      const saved = localStorage.getItem("labelClipCounters");
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+  
+  // Speichere Clip-Zähler in localStorage
+  useEffect(() => {
+    localStorage.setItem("labelClipCounters", JSON.stringify(labelClipCounters));
+  }, [labelClipCounters]);
   
   // Keyboard shortcuts for quick labeling (F, G, H keys)
   const [quickLabelF, setQuickLabelF] = useState("MAG-Schweißen");
@@ -200,23 +220,24 @@ export const ImageAnnotator = () => {
   // Apply quick label to all detections on current image AND unmark from deletion
   const applyQuickLabel = (label: string) => {
     if (images.length === 0 || !currentImage) return;
-    
+
     const newImages = [...images];
-    newImages[currentIndex].detections = newImages[currentIndex].detections.map(det => ({
+    newImages[currentIndex].activityLabel = label;
+    newImages[currentIndex].detections = newImages[currentIndex].detections.map((det) => ({
       ...det,
-      label
+      label,
     }));
     setImages(newImages);
-    
+
     // Automatically unmark from deletion when labeled
     if (selectedImages.has(currentIndex)) {
-      setSelectedImages(prev => {
+      setSelectedImages((prev) => {
         const newSet = new Set(prev);
         newSet.delete(currentIndex);
         return newSet;
       });
     }
-    
+
     toast.success(`Label "${label}" angewendet (demarkiert)`);
   };
 
@@ -1144,7 +1165,7 @@ export const ImageAnnotator = () => {
   // Re-detect with new threshold
   const handleRedetect = async () => {
     if (!model || images.length === 0) return;
-    
+
     setIsProcessing(true);
     toast.loading("Erneute Analyse mit neuem Schwellenwert...");
 
@@ -1152,20 +1173,29 @@ export const ImageAnnotator = () => {
 
     for (let i = 0; i < images.length; i++) {
       const img = images[i];
-      const detections = await detectObjects(img.file, confidenceThreshold);
-      
+      const keepLabel = (img.activityLabel ?? "").trim();
+
+      let detections = await detectObjects(img.file, confidenceThreshold);
+
+      // Wichtig: wenn der Frame bereits gelabelt wurde, darf "Neu erkennen" das Label nicht wieder auf "Person" zurücksetzen.
+      if (keepLabel) {
+        detections = detections.map((d) =>
+          d.label.toLowerCase() === "person" ? { ...d, label: keepLabel } : d
+        );
+      }
+
       newImages.push({
         ...img,
         detections,
       });
-      
+
       toast.loading(`Verarbeite ${i + 1} von ${images.length}...`);
     }
 
     setImages(newImages);
     setSelectedDetection(null);
     setIsProcessing(false);
-    
+
     const totalDetections = newImages.reduce((sum, img) => sum + img.detections.length, 0);
     toast.success(`${totalDetections} Objekte mit ${(confidenceThreshold * 100).toFixed(0)}% Schwellenwert erkannt!`);
   };
@@ -1185,15 +1215,55 @@ export const ImageAnnotator = () => {
   };
 
   const handleReset = () => {
+    // Vollständiges Zurücksetzen aller Zustände
     setImages([]);
     setCurrentIndex(0);
     setSelectedDetection(null);
+    setSelectedImages(new Set());
+    setResizing(null);
+    setPreviewDetection(null);
+    setEditingLabel(null);
+    setEditLabelValue("");
+    setExtractionProgress(0);
+    setIsProcessing(false);
     toast.success("Bilder zurückgesetzt!");
   };
+  
+  const handleClipsReset = () => {
+    // Vollständiges Zurücksetzen der Clips und aller zugehörigen Zustände
+    setClips([]);
+    setClipProgress(0);
+    setIsCreatingClips(false);
+    // Auch Annotator zurücksetzen um Überlappung zu vermeiden
+    setImages([]);
+    setCurrentIndex(0);
+    setSelectedDetection(null);
+    setSelectedImages(new Set());
+    setResizing(null);
+    setPreviewDetection(null);
+    setEditingLabel(null);
+    setEditLabelValue("");
+    setExtractionProgress(0);
+    setIsProcessing(false);
+    toast.success("Alles zurückgesetzt!");
+  };
 
-  // Export annotated clips grouped by clip name
-  // Structure: {ClipName}/Labeled/00001.jpg, ..., annotations.json
-  //            {ClipName}/Unlabeled/00001.jpg, ...
+  // Export (gewünschte Struktur): nach Tätigkeit (Label) und darunter nach Clip
+  //
+  // {LabelName}/
+  //   {LabelName}01/
+  //     frames00001.jpg
+  //     frames00002.jpg
+  //   {LabelName}02/
+  //     ...
+  // {LabelName} labeld/
+  //   {LabelName}01/
+  //     frames00001.json
+  //     frames00002.json
+  //   {LabelName}02/
+  //     ...
+  //
+  // Hinweis: Clip-Ordner werden je Label als 01, 02, 03... durchnummeriert (stabile Reihenfolge nach Clip-Name).
   const handleExportAnnotatedClips = async () => {
     const zip = new JSZip();
 
@@ -1232,8 +1302,13 @@ export const ImageAnnotator = () => {
         .replace(/\.mkv$/i, "")
         .replace(/\.webm$/i, "");
 
-    // Helper to get custom label from detections (non-COCO labels)
+    const pad2 = (n: number) => String(n).padStart(2, "0");
+
+    // Helper to get custom label from the frame (priority: explicit activityLabel, fallback: detections)
     const getCustomLabel = (img: ImageData): string | null => {
+      const explicit = (img.activityLabel ?? "").trim();
+      if (explicit) return explicit;
+
       for (const det of img.detections) {
         const label = (det.label ?? "").trim();
         if (label && !cocoLabels.has(label.toLowerCase())) {
@@ -1243,93 +1318,116 @@ export const ImageAnnotator = () => {
       return null;
     };
 
-    // Get all non-deleted images (exclude marked ones)
-    const validImages = images
-      .map((img, idx) => ({ img, idx }))
-      .filter(({ idx }) => !selectedImages.has(idx));
+    // Filter images based on exportOnlyLabeled setting
+    const imagesToExport = exportOnlyLabeled
+      ? images
+          .map((img, idx) => ({ img, idx }))
+          .filter(({ img }) => getCustomLabel(img) !== null)
+      : images.map((img, idx) => ({ img, idx }));
 
-    if (validImages.length === 0) {
-      toast.error("Keine Frames zum Exportieren (alle markiert oder keine vorhanden)");
+    if (imagesToExport.length === 0) {
+      toast.error(
+        exportOnlyLabeled
+          ? "Keine gelabelten Frames zum Exportieren. Bitte erst labeln!"
+          : "Keine Frames zum Exportieren."
+      );
       return;
     }
 
-    // Group by clip name (sourceVideo) and find dominant label per clip
-    const byClip = new Map<string, { img: ImageData; idx: number }[]>();
-    for (const item of validImages) {
-      const clipKey = (item.img.sourceVideo ?? "ungrouped").trim() || "ungrouped";
-      if (!byClip.has(clipKey)) byClip.set(clipKey, []);
-      byClip.get(clipKey)!.push(item);
+    // Build label -> clip -> frames
+    const byLabel = new Map<string, Map<string, ImageData[]>>();
+    const unlabeledByClip = new Map<string, ImageData[]>();
+
+    for (const { img } of imagesToExport) {
+      const clipKey = (img.sourceVideo ?? "ungrouped").trim() || "ungrouped";
+      const label = getCustomLabel(img);
+
+      if (label) {
+        if (!byLabel.has(label)) byLabel.set(label, new Map());
+        const byClip = byLabel.get(label)!;
+        if (!byClip.has(clipKey)) byClip.set(clipKey, []);
+        byClip.get(clipKey)!.push(img);
+      } else if (!exportOnlyLabeled) {
+        if (!unlabeledByClip.has(clipKey)) unlabeledByClip.set(clipKey, []);
+        unlabeledByClip.get(clipKey)!.push(img);
+      }
     }
+
+    const sortFrames = (frames: ImageData[]) =>
+      frames.sort((a, b) => {
+        const fa = a.frameNumber ?? 0;
+        const fb = b.frameNumber ?? 0;
+        if (fa !== fb) return fa - fb;
+        return a.file.name.localeCompare(b.file.name);
+      });
+
+    // Stable ordering inside each clip
+    for (const [, byClip] of byLabel) {
+      for (const [, frames] of byClip) sortFrames(frames);
+    }
+    for (const [, frames] of unlabeledByClip) sortFrames(frames);
 
     let totalExportedFrames = 0;
     let totalExportedClips = 0;
 
-    // Counter for clips with same label name
-    const labelCounter = new Map<string, number>();
+    // Track new clip counters for this export
+    const newClipCounters: Record<string, number> = { ...labelClipCounters };
 
-    for (const [clipSourceVideo, clipItems] of byClip) {
-      // Sort frames within clip
-      clipItems.sort((a, b) => {
-        const fa = a.img.frameNumber ?? 0;
-        const fb = b.img.frameNumber ?? 0;
-        if (fa !== fb) return fa - fb;
-        return a.img.file.name.localeCompare(b.img.file.name);
-      });
+    for (const [label, byClip] of byLabel) {
+      const safeLabel = toSafePathSegment(label);
 
-      // Separate labeled and unlabeled frames
-      const labeledFrames: ImageData[] = [];
-      const unlabeledFrames: ImageData[] = [];
+      const jpgRoot = zip.folder(safeLabel);
+      const jsonRoot = zip.folder(`${safeLabel} labeld`);
+      if (!jpgRoot || !jsonRoot) continue;
 
-      for (const { img } of clipItems) {
-        const label = getCustomLabel(img);
-        if (label) {
-          labeledFrames.push(img);
-        } else {
-          unlabeledFrames.push(img);
+      // Hole den aktuellen Clip-Zähler für dieses Label (oder starte bei 0)
+      let currentClipOffset = newClipCounters[label] || 0;
+
+      const clipKeys = Array.from(byClip.keys()).sort((a, b) => a.localeCompare(b));
+
+      const MAX_FRAMES_PER_CLIP = 200;
+      let totalClipsForLabel = 0;
+
+      for (let clipIndex = 0; clipIndex < clipKeys.length; clipIndex++) {
+        const clipKey = clipKeys[clipIndex];
+        const frames = byClip.get(clipKey) ?? [];
+        if (frames.length === 0) continue;
+
+        // Teile Frames in Chunks von max 200 auf
+        const frameChunks: ImageData[][] = [];
+        for (let i = 0; i < frames.length; i += MAX_FRAMES_PER_CLIP) {
+          frameChunks.push(frames.slice(i, i + MAX_FRAMES_PER_CLIP));
         }
-      }
 
-      // Determine folder name: use the dominant custom label or fallback to sourceVideo
-      let folderLabel = "Unlabeled_Clip";
-      
-      if (labeledFrames.length > 0) {
-        // Count labels to find dominant one
-        const labelCounts = new Map<string, number>();
-        for (const img of labeledFrames) {
-          const label = getCustomLabel(img);
-          if (label) {
-            labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
-          }
-        }
-        // Find most frequent label
-        let maxCount = 0;
-        for (const [label, count] of labelCounts) {
-          if (count > maxCount) {
-            maxCount = count;
-            folderLabel = label;
-          }
-        }
-      }
+        for (let chunkIndex = 0; chunkIndex < frameChunks.length; chunkIndex++) {
+          const chunkFrames = frameChunks[chunkIndex];
+          totalExportedClips++;
+          totalClipsForLabel++;
 
-      // Add counter suffix if same label appears multiple times
-      const currentCount = (labelCounter.get(folderLabel) || 0) + 1;
-      labelCounter.set(folderLabel, currentCount);
-      const clipFolderName = currentCount > 1 ? `${folderLabel}${currentCount}` : folderLabel;
+          // Fortlaufende Clip-Nummerierung über Videos hinweg
+          const clipNumber = currentClipOffset + totalClipsForLabel;
+          const clipFolderName = `${safeLabel}${pad2(clipNumber)}`;
+          const jpgClipFolder = jpgRoot.folder(toSafePathSegment(clipFolderName));
+          const jsonClipFolder = jsonRoot.folder(toSafePathSegment(clipFolderName));
+          if (!jpgClipFolder || !jsonClipFolder) continue;
 
-      const safeClipName = toSafePathSegment(clipFolderName);
-      const clipFolder = zip.folder(safeClipName);
-      if (!clipFolder) continue;
+          // Frame-Zähler beginnt bei JEDEM CLIP neu bei 1
+          let clipFrameCounter = 0;
 
-      // Export labeled frames as individual JSON files
-      if (labeledFrames.length > 0) {
-        const labeledFolder = clipFolder.folder("Labeled");
-        if (labeledFolder) {
-          let frameCounter = 0;
-          for (const img of labeledFrames) {
-            frameCounter++;
-            const jsonFileName = `${String(frameCounter).padStart(5, "0")}.json`;
+          for (const img of chunkFrames) {
+            clipFrameCounter++;
+            const baseName = `frames${String(clipFrameCounter).padStart(5, "0")}`;
 
-            const frameLabel = getCustomLabel(img);
+            // JPG
+            try {
+              const response = await fetch(img.url);
+              const blob = await response.blob();
+              jpgClipFolder.file(`${baseName}.jpg`, blob);
+            } catch (e) {
+              console.warn("Failed to export frame image", img.file?.name, e);
+            }
+
+            // JSON
             const customDetections = img.detections.filter((d) => {
               const l = (d.label ?? "").trim();
               if (!l) return false;
@@ -1346,9 +1444,10 @@ export const ImageAnnotator = () => {
             const frameData = {
               width: dims.width,
               height: dims.height,
-              sourceVideo: img.sourceVideo ?? null,
+              sourceClip: clipKey,
+              clipFolder: clipFolderName,
               frameNumber: img.frameNumber ?? null,
-              activityLabel: frameLabel,
+              activityLabel: label,
               annotations: customDetections.map((det) => ({
                 label: det.label,
                 x: Math.round(det.x),
@@ -1359,47 +1458,47 @@ export const ImageAnnotator = () => {
               })),
             };
 
-            labeledFolder.file(jsonFileName, JSON.stringify(frameData, null, 2));
+            jsonClipFolder.file(`${baseName}.json`, JSON.stringify(frameData, null, 2));
+
             totalExportedFrames++;
           }
         }
       }
+      
+      // Update den Clip-Zähler für dieses Label
+      newClipCounters[label] = currentClipOffset + totalClipsForLabel;
+    }
+    
+    // Speichere die neuen Clip-Zähler
+    setLabelClipCounters(newClipCounters);
 
-      // Export unlabeled frames
-      if (unlabeledFrames.length > 0) {
-        const unlabeledFolder = clipFolder.folder("Unlabeled");
-        if (unlabeledFolder) {
+    // Optional: export unlabeled frames if exportOnlyLabeled is off
+    if (!exportOnlyLabeled && unlabeledByClip.size > 0) {
+      const unlabeledRoot = zip.folder("Unlabeled");
+      if (unlabeledRoot) {
+        const clipKeys = Array.from(unlabeledByClip.keys()).sort((a, b) => a.localeCompare(b));
+        for (const clipKey of clipKeys) {
+          const frames = unlabeledByClip.get(clipKey) ?? [];
+          if (frames.length === 0) continue;
+
+          const clipFolder = unlabeledRoot.folder(toSafePathSegment(clipKey));
+          if (!clipFolder) continue;
+
           let frameCounter = 0;
-          for (const img of unlabeledFrames) {
+          for (const img of frames) {
             frameCounter++;
-            const newFileName = `${String(frameCounter).padStart(5, "0")}.jpg`;
-
-            const response = await fetch(img.url);
-            const blob = await response.blob();
-            unlabeledFolder.file(newFileName, blob);
-
-            totalExportedFrames++;
+            const baseName = String(frameCounter).padStart(5, "0");
+            try {
+              const response = await fetch(img.url);
+              const blob = await response.blob();
+              clipFolder.file(`${baseName}.jpg`, blob);
+              totalExportedFrames++;
+            } catch (e) {
+              console.warn("Failed to export unlabeled frame", img.file?.name, e);
+            }
           }
         }
       }
-
-      // Add clip.json with metadata
-      clipFolder.file(
-        "clip.json",
-        JSON.stringify(
-          {
-            clip: clipFolderName,
-            sourceVideo: clipSourceVideo,
-            labeledFrames: labeledFrames.length,
-            unlabeledFrames: unlabeledFrames.length,
-            totalFrames: labeledFrames.length + unlabeledFrames.length,
-          },
-          null,
-          2
-        )
-      );
-
-      totalExportedClips++;
     }
 
     const blob = await zip.generateAsync({ type: "blob" });
@@ -1409,7 +1508,9 @@ export const ImageAnnotator = () => {
     a.download = "clips_export.zip";
     a.click();
 
-    toast.success(`Export: ${totalExportedClips} Clips, ${totalExportedFrames} Frames`);
+    toast.success(
+      `Export: ${totalExportedClips} Clips, ${totalExportedFrames} Frames${exportOnlyLabeled ? " (nur gelabelt)" : ""}`
+    );
   };
 
   // Export structure (exact as requested):
@@ -1501,12 +1602,16 @@ export const ImageAnnotator = () => {
     for (const [label, items] of byLabel) {
       const safeLabel = toSafePathSegment(label);
 
-      const labelFolder = zip.folder(safeLabel);
-      if (!labelFolder) continue;
-
-      const labeledFolder = labelFolder.folder(`${safeLabel}_labeled`);
-      const unlabeledFolder = labelFolder.folder(`${safeLabel}_unlabeled`);
-      if (!labeledFolder || !unlabeledFolder) continue;
+      // New structure:
+      // Label/
+      //   Label01.jpg
+      //   Label02.jpg
+      // Label labeled/
+      //   Label01.json
+      //   Label02.json
+      const jpgFolder = zip.folder(safeLabel);
+      const jsonFolder = zip.folder(`${safeLabel} labeled`);
+      if (!jpgFolder || !jsonFolder) continue;
 
       let counter = 0;
 
@@ -1516,12 +1621,12 @@ export const ImageAnnotator = () => {
 
         const baseName = `${safeLabel}${String(counter).padStart(2, "0")}`;
 
-        // Write JPG to *_unlabeled
+        // Write JPG to Label folder
         const response = await fetch(img.url);
         const blob = await response.blob();
-        unlabeledFolder.file(`${baseName}.jpg`, blob);
+        jpgFolder.file(`${baseName}.jpg`, blob);
 
-        // Write JSON to *_labeled
+        // Write JSON to Label labeled folder
         const customDetections = img.detections.filter((d) => {
           const l = (d.label ?? "").trim();
           if (!l) return false;
@@ -1547,7 +1652,7 @@ export const ImageAnnotator = () => {
                 confidence: det.confidence,
               })),
             };
-            labeledFolder.file(`${baseName}.json`, JSON.stringify(annotation, null, 2));
+            jsonFolder.file(`${baseName}.json`, JSON.stringify(annotation, null, 2));
             resolve();
           };
           imgElement.onerror = () => resolve();
@@ -1635,7 +1740,7 @@ export const ImageAnnotator = () => {
                           </>
                         )}
                       </Button>
-                      <Button onClick={() => setClips([])} variant="ghost">
+                      <Button onClick={handleClipsReset} variant="ghost">
                         Zurücksetzen
                       </Button>
                     </>
@@ -1678,6 +1783,28 @@ export const ImageAnnotator = () => {
                     />
                     <p className="text-xs text-muted-foreground mt-1">
                       YOWO Standard: 32 Frames pro Clip
+                    </p>
+                  </div>
+                  
+                  {/* Export Settings */}
+                  <div className="mt-4 pt-4 border-t border-border/50">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-medium">Export: Nur gelabelte Frames</p>
+                        <p className="text-xs text-muted-foreground">
+                          Ungelabelte Frames werden ignoriert
+                        </p>
+                      </div>
+                      <Button
+                        variant={exportOnlyLabeled ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setExportOnlyLabeled(!exportOnlyLabeled)}
+                      >
+                        {exportOnlyLabeled ? "Aktiv" : "Aus"}
+                      </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-2 p-2 bg-secondary/50 rounded">
+                      Struktur: <code>ClipXX/LabelName/Labeled/*.json</code> + <code>Unlabeled/*.jpg</code>
                     </p>
                   </div>
                 </div>
@@ -1966,6 +2093,28 @@ export const ImageAnnotator = () => {
                       </>
                     )}
                   </div>
+                  
+                  {/* Export Settings */}
+                  <div className="pt-4 border-t border-border/50">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-medium">Export: Nur gelabelte Frames</p>
+                        <p className="text-xs text-muted-foreground">
+                          Ungelabelte werden ignoriert
+                        </p>
+                      </div>
+                      <Button
+                        variant={exportOnlyLabeled ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setExportOnlyLabeled(!exportOnlyLabeled)}
+                      >
+                        {exportOnlyLabeled ? "Aktiv" : "Aus"}
+                      </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-2 p-2 bg-secondary/50 rounded">
+                      Struktur: <code className="text-primary">ClipXX/LabelName/Labeled/*.json</code> + <code className="text-primary">Unlabeled/*.jpg</code>
+                    </p>
+                  </div>
                 </div>
               </Card>
             ) : (
@@ -2214,19 +2363,21 @@ export const ImageAnnotator = () => {
                           
                           for (let i = from; i <= to; i++) {
                             // Wenn keine Detektionen vorhanden, führe Personen-Erkennung durch
+                            newImages[i].activityLabel = label;
+
                             if (newImages[i].detections.length === 0 && model) {
                               const detections = await detectObjects(newImages[i].file, confidenceThreshold);
                               // Nur "Person" Detektionen behalten und mit dem Label versehen
                               const personDetections = detections
-                                .filter(d => d.label.toLowerCase() === 'person')
-                                .map(d => ({ ...d, label }));
+                                .filter((d) => d.label.toLowerCase() === "person")
+                                .map((d) => ({ ...d, label }));
                               newImages[i].detections = personDetections;
                               if (personDetections.length > 0) detectedCount++;
                             } else {
                               // Bestehende Detektionen nur umbenennen
-                              newImages[i].detections = newImages[i].detections.map(d => ({
+                              newImages[i].detections = newImages[i].detections.map((d) => ({
                                 ...d,
-                                label: label
+                                label: label,
                               }));
                             }
                           }
@@ -2431,6 +2582,131 @@ export const ImageAnnotator = () => {
                     </div>
                   </div>
 
+                  {/* Export Settings */}
+                  <div className="pb-4 border-b border-border">
+                    <h3 className="font-semibold mb-3 flex items-center gap-2">
+                      <Download className="w-4 h-4" />
+                      Export-Einstellungen
+                    </h3>
+                    
+                    <div className="space-y-4">
+                      {/* Bounding Box Padding */}
+                      <div>
+                        <div className="flex justify-between text-sm mb-2">
+                          <span className="text-muted-foreground font-medium">Bounding Box Padding:</span>
+                          <span className="font-bold">{boundingBoxPadding}%</span>
+                        </div>
+                        <Slider
+                          value={[boundingBoxPadding]}
+                          onValueChange={([v]) => setBoundingBoxPadding(v)}
+                          min={0}
+                          max={50}
+                          step={5}
+                        />
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Erweitert Erkennungsboxen um {boundingBoxPadding}% links/rechts für Werkzeuge
+                        </p>
+                      </div>
+                      
+                      {/* Motion Blur Filter */}
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm text-muted-foreground font-medium">Bewegungsunschärfe filtern:</span>
+                          <Button
+                            variant={filterMotionBlur ? "default" : "outline"}
+                            size="sm"
+                            onClick={() => setFilterMotionBlur(!filterMotionBlur)}
+                          >
+                            {filterMotionBlur ? "Aktiv" : "Aus"}
+                          </Button>
+                        </div>
+                        {filterMotionBlur && (
+                          <>
+                            <div className="flex items-center gap-3">
+                              <span className="text-sm w-10">{blurThreshold}</span>
+                              <Slider
+                                value={[blurThreshold]}
+                                onValueChange={([v]) => setBlurThreshold(v)}
+                                min={50}
+                                max={300}
+                                step={10}
+                              />
+                            </div>
+                            <p className="text-xs text-muted-foreground mt-1">
+                              Höher = weniger streng. Niedrig = strenger
+                            </p>
+                          </>
+                        )}
+                      </div>
+                      
+                      {/* Export Only Labeled */}
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="text-sm font-medium">Nur gelabelte Frames</p>
+                            <p className="text-xs text-muted-foreground">
+                              Ungelabelte werden ignoriert
+                            </p>
+                          </div>
+                          <Button
+                            variant={exportOnlyLabeled ? "default" : "outline"}
+                            size="sm"
+                            onClick={() => setExportOnlyLabeled(!exportOnlyLabeled)}
+                          >
+                            {exportOnlyLabeled ? "Aktiv" : "Aus"}
+                          </Button>
+                        </div>
+                        
+                        <div className="text-xs text-muted-foreground mt-2 p-2 bg-secondary/50 rounded space-y-1">
+                          <p className="font-medium">Export-Struktur:</p>
+                          <div className="pl-2 font-mono">
+                            <p>Label/</p>
+                            <p className="pl-3">└─ Label01/</p>
+                            <p className="pl-6">├─ frames00001.jpg</p>
+                            <p className="pl-6">└─ frames00002.jpg</p>
+                            <p>Label labeld/</p>
+                            <p className="pl-3">└─ Label01/</p>
+                            <p className="pl-6">├─ frames00001.json</p>
+                            <p className="pl-6">└─ frames00002.json</p>
+                          </div>
+                          <p className="mt-2 text-xs italic">Jedes Label beginnt bei frames00001</p>
+                          <p className="text-xs italic">Clip-Ordner fortlaufend über Videos</p>
+                        </div>
+                        
+                        {/* Clip-Zähler Anzeige & Reset */}
+                        <div className="mt-3 p-2 bg-primary/10 rounded border border-primary/20">
+                          <div className="flex items-center justify-between mb-2">
+                            <p className="text-xs font-medium">Aktuelle Clip-Zähler:</p>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-6 text-xs"
+                              onClick={() => {
+                                setLabelClipCounters({});
+                                toast.success("Alle Zähler zurückgesetzt für neues Projekt!");
+                              }}
+                            >
+                              <RotateCcw className="w-3 h-3 mr-1" />
+                              Neu starten
+                            </Button>
+                          </div>
+                          {Object.keys(labelClipCounters).length > 0 ? (
+                            <div className="space-y-1">
+                              {Object.entries(labelClipCounters).map(([label, count]) => (
+                                <div key={label} className="flex justify-between text-xs">
+                                  <span className="text-muted-foreground">{label}:</span>
+                                  <span className="font-mono">{count} Clips → nächster: {String(count + 1).padStart(2, "0")}</span>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-xs text-muted-foreground italic">Noch keine Exports - startet bei 01</p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Quick Activity Labels */}
                   <div className="pb-4 border-b border-border">
                     <h3 className="font-semibold mb-3 flex items-center gap-2">
@@ -2448,6 +2724,7 @@ export const ImageAnnotator = () => {
                           onClick={() => {
                             if (selectedDetection !== null) {
                               const newImages = [...images];
+                              newImages[currentIndex].activityLabel = label;
                               newImages[currentIndex].detections[selectedDetection].label = label;
                               setImages(newImages);
                               toast.success(`Label auf "${label}" geändert`);
@@ -2555,6 +2832,7 @@ export const ImageAnnotator = () => {
                                   onKeyDown={(e) => {
                                     if (e.key === 'Enter') {
                                       const newImages = [...images];
+                                      newImages[currentIndex].activityLabel = editLabelValue;
                                       newImages[currentIndex].detections[idx].label = editLabelValue;
                                       setImages(newImages);
                                       setEditingLabel(null);
@@ -2572,6 +2850,7 @@ export const ImageAnnotator = () => {
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     const newImages = [...images];
+                                    newImages[currentIndex].activityLabel = editLabelValue;
                                     newImages[currentIndex].detections[idx].label = editLabelValue;
                                     setImages(newImages);
                                     setEditingLabel(null);
