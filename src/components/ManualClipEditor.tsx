@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Slider } from "@/components/ui/slider";
-import { Play, Pause, Trash2, Scissors, Check, Video, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, X } from "lucide-react";
+import { Play, Pause, Trash2, Scissors, Check, Video, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, X, SkipBack, SkipForward } from "lucide-react";
 import { toast } from "sonner";
 
 interface ClipMarker {
@@ -136,9 +136,30 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
   // Seek video
   const seekTo = (time: number) => {
     if (videoRef.current) {
-      videoRef.current.currentTime = time;
-      setCurrentTime(time);
+      const clampedTime = Math.max(0, Math.min(time, duration));
+      videoRef.current.currentTime = clampedTime;
+      setCurrentTime(clampedTime);
     }
+  };
+
+  // Frame step (assumes ~30fps, so 1 frame ≈ 0.033s)
+  const frameStep = 1 / 30; // ~33ms per frame
+  
+  const stepFrame = (direction: 1 | -1) => {
+    if (!videoRef.current) return;
+    // Pause video when stepping
+    if (isPlaying) {
+      videoRef.current.pause();
+      setIsPlaying(false);
+    }
+    const newTime = currentTime + (direction * frameStep);
+    seekTo(newTime);
+  };
+
+  // Snap time to grid (0.5 second intervals)
+  const snapToGrid = (time: number): number => {
+    const snapInterval = 0.5; // Snap to every 0.5 seconds
+    return Math.round(time / snapInterval) * snapInterval;
   };
 
   // Format time as MM:SS.ss
@@ -148,7 +169,17 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
     return `${mins.toString().padStart(2, "0")}:${secs.toFixed(1).padStart(4, "0")}`;
   };
 
-  // Handle timeline click - TWO CLICK MARKER CREATION
+  // Format time short (just seconds)
+  const formatTimeShort = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    if (mins > 0) {
+      return `${mins}:${secs.toString().padStart(2, "0")}`;
+    }
+    return `${secs}s`;
+  };
+
+  // Handle timeline click - TWO CLICK MARKER CREATION with SNAPPING
   const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!timelineRef.current || duration === 0) return;
     const rect = timelineRef.current.getBoundingClientRect();
@@ -157,7 +188,10 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
     
     // Calculate time based on zoom and offset
     const visibleDuration = duration / zoomLevel;
-    const clickedTime = Math.max(0, Math.min(timelineOffset + ratio * visibleDuration, duration));
+    const rawTime = Math.max(0, Math.min(timelineOffset + ratio * visibleDuration, duration));
+    
+    // Snap to grid
+    const clickedTime = snapToGrid(rawTime);
     
     // If no pending start, set this as start
     if (pendingMarkerStart === null) {
@@ -341,6 +375,87 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
     }
   }, [currentTime, duration, zoomLevel]);
 
+  // Keyboard shortcuts for frame stepping and marker creation
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!videoUrl) return;
+      
+      // Skip if user is typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      
+      switch (e.key) {
+        case 'ArrowLeft':
+          e.preventDefault();
+          stepFrame(-1);
+          break;
+        case 'ArrowRight':
+          e.preventDefault();
+          stepFrame(1);
+          break;
+        case ' ':
+          e.preventDefault();
+          // Space = Set marker (start or end)
+          handleSpaceMarker();
+          break;
+        case ',':
+          e.preventDefault();
+          stepFrame(-1);
+          break;
+        case '.':
+          e.preventDefault();
+          stepFrame(1);
+          break;
+        case 'p':
+        case 'P':
+          e.preventDefault();
+          togglePlayPause();
+          break;
+        case 'Escape':
+          if (pendingMarkerStart !== null) {
+            e.preventDefault();
+            cancelPendingMarker();
+          }
+          break;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [videoUrl, currentTime, isPlaying, duration, pendingMarkerStart]);
+
+  // Handle space key for marker creation
+  const handleSpaceMarker = () => {
+    if (duration === 0) return;
+    
+    const snappedTime = snapToGrid(currentTime);
+    
+    if (pendingMarkerStart === null) {
+      // First press - set start
+      setPendingMarkerStart(snappedTime);
+      toast.info(`▶ Start: ${formatTime(snappedTime)} - Drücke Space für Ende`);
+    } else {
+      // Second press - create marker
+      const startTime = Math.min(pendingMarkerStart, snappedTime);
+      const endTime = Math.max(pendingMarkerStart, snappedTime);
+      
+      if (endTime - startTime < 0.5) {
+        toast.error("Clip muss mindestens 0.5 Sekunden lang sein");
+        setPendingMarkerStart(null);
+        return;
+      }
+      
+      const newMarker: ClipMarker = {
+        id: Date.now().toString(),
+        startTime,
+        endTime,
+      };
+      
+      setMarkers(prev => [...prev, newMarker].sort((a, b) => a.startTime - b.startTime));
+      setPendingMarkerStart(null);
+      toast.success(`✓ Clip erstellt: ${formatTime(startTime)} - ${formatTime(endTime)}`);
+    }
+  };
+
   const { start: visibleStart, end: visibleEnd } = getVisibleRange();
 
   return (
@@ -395,23 +510,68 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
           </div>
 
           {/* Playback Controls */}
-          <div className="flex items-center gap-4">
-            <Button onClick={togglePlayPause} variant="outline" size="sm">
+          <div className="flex items-center gap-2">
+            {/* Frame back */}
+            <Button 
+              onClick={() => stepFrame(-1)} 
+              variant="outline" 
+              size="sm"
+              title="1 Frame zurück (← oder ,)"
+            >
+              <SkipBack className="w-4 h-4" />
+            </Button>
+            
+            {/* Play/Pause */}
+            <Button onClick={togglePlayPause} variant="outline" size="sm" title="Play/Pause (Leertaste)">
               {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
             </Button>
             
+            {/* Frame forward */}
+            <Button 
+              onClick={() => stepFrame(1)} 
+              variant="outline" 
+              size="sm"
+              title="1 Frame vor (→ oder .)"
+            >
+              <SkipForward className="w-4 h-4" />
+            </Button>
+            
+            {/* Slider */}
             <div className="flex-1">
               <Slider
                 value={[currentTime]}
                 onValueChange={([v]) => seekTo(v)}
                 min={0}
                 max={duration || 1}
-                step={0.1}
+                step={0.001}
+                className="cursor-pointer"
               />
             </div>
             
-            <span className="text-sm text-muted-foreground font-mono min-w-[100px]">
+            {/* Time display with frame info */}
+            <span className="text-sm text-muted-foreground font-mono min-w-[140px] text-right">
               {formatTime(currentTime)} / {formatTime(duration)}
+            </span>
+          </div>
+          
+          {/* Keyboard shortcuts hint */}
+          <div className="flex items-center gap-4 text-xs text-muted-foreground flex-wrap">
+            <span className="flex items-center gap-1">
+              <kbd className="px-1.5 py-0.5 bg-primary/20 text-primary rounded text-[10px] font-mono font-bold">Space</kbd>
+              Marker setzen
+            </span>
+            <span className="flex items-center gap-1">
+              <kbd className="px-1.5 py-0.5 bg-muted rounded text-[10px] font-mono">←</kbd>
+              <kbd className="px-1.5 py-0.5 bg-muted rounded text-[10px] font-mono">→</kbd>
+              Frame
+            </span>
+            <span className="flex items-center gap-1">
+              <kbd className="px-1.5 py-0.5 bg-muted rounded text-[10px] font-mono">P</kbd>
+              Play/Pause
+            </span>
+            <span className="flex items-center gap-1">
+              <kbd className="px-1.5 py-0.5 bg-muted rounded text-[10px] font-mono">Esc</kbd>
+              Abbrechen
             </span>
           </div>
 
@@ -438,77 +598,198 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
             
             <div
               ref={timelineRef}
-              className={`relative h-20 rounded-lg cursor-crosshair overflow-hidden ${pendingMarkerStart !== null ? 'bg-primary/20 ring-2 ring-primary' : 'bg-secondary'}`}
+              className={`relative h-32 rounded-lg cursor-crosshair overflow-hidden border ${pendingMarkerStart !== null ? 'bg-primary/10 ring-2 ring-primary border-primary' : 'bg-background border-border'}`}
               onClick={handleTimelineClick}
             >
-              {/* Time markers */}
-              <div className="absolute inset-0 flex items-end pb-1">
-                {Array.from({ length: 11 }).map((_, i) => {
-                  const time = visibleStart + (visibleEnd - visibleStart) * (i / 10);
+              {/* Grid background with second markers */}
+              <div className="absolute inset-0">
+                {/* Generate grid lines for each second */}
+                {(() => {
+                  const visibleDuration = visibleEnd - visibleStart;
+                  const lines: JSX.Element[] = [];
+                  
+                  // Determine appropriate interval based on zoom
+                  let interval = 1; // 1 second default
+                  if (visibleDuration > 60) interval = 10;
+                  else if (visibleDuration > 30) interval = 5;
+                  else if (visibleDuration > 10) interval = 2;
+                  else if (visibleDuration < 5) interval = 0.5;
+                  
+                  // Find first line position
+                  const firstLine = Math.ceil(visibleStart / interval) * interval;
+                  
+                  for (let time = firstLine; time <= visibleEnd; time += interval) {
+                    const position = getTimelinePosition(time);
+                    if (position < 0 || position > 100) continue;
+                    
+                    const isMainSecond = time % 1 === 0;
+                    const isFiveSecond = time % 5 === 0;
+                    const isTenSecond = time % 10 === 0;
+                    
+                    lines.push(
+                      <div
+                        key={`grid-${time}`}
+                        className="absolute top-0 bottom-0 pointer-events-none"
+                        style={{ left: `${position}%` }}
+                      >
+                        {/* Grid line */}
+                        <div 
+                          className={`w-px h-full ${
+                            isTenSecond 
+                              ? 'bg-foreground/30' 
+                              : isFiveSecond 
+                                ? 'bg-foreground/20' 
+                                : isMainSecond 
+                                  ? 'bg-foreground/10' 
+                                  : 'bg-foreground/5'
+                          }`} 
+                        />
+                      </div>
+                    );
+                  }
+                  return lines;
+                })()}
+                
+                {/* Sub-grid for half seconds when zoomed in */}
+                {(() => {
+                  const visibleDuration = visibleEnd - visibleStart;
+                  if (visibleDuration > 10) return null;
+                  
+                  const lines: JSX.Element[] = [];
+                  const interval = 0.5;
+                  const firstLine = Math.ceil(visibleStart / interval) * interval;
+                  
+                  for (let time = firstLine; time <= visibleEnd; time += interval) {
+                    if (time % 1 === 0) continue; // Skip full seconds
+                    const position = getTimelinePosition(time);
+                    if (position < 0 || position > 100) continue;
+                    
+                    lines.push(
+                      <div
+                        key={`subgrid-${time}`}
+                        className="absolute top-0 bottom-0 pointer-events-none"
+                        style={{ left: `${position}%` }}
+                      >
+                        <div className="w-px h-full bg-foreground/5" />
+                      </div>
+                    );
+                  }
+                  return lines;
+                })()}
+              </div>
+
+              {/* Time labels at bottom */}
+              <div className="absolute bottom-0 left-0 right-0 h-6 bg-muted/50 border-t border-border">
+                {(() => {
+                  const visibleDuration = visibleEnd - visibleStart;
+                  const labels: JSX.Element[] = [];
+                  
+                  // Determine label interval
+                  let labelInterval = 1;
+                  if (visibleDuration > 120) labelInterval = 30;
+                  else if (visibleDuration > 60) labelInterval = 10;
+                  else if (visibleDuration > 30) labelInterval = 5;
+                  else if (visibleDuration > 10) labelInterval = 2;
+                  else if (visibleDuration < 3) labelInterval = 0.5;
+                  
+                  const firstLabel = Math.ceil(visibleStart / labelInterval) * labelInterval;
+                  
+                  for (let time = firstLabel; time <= visibleEnd; time += labelInterval) {
+                    const position = getTimelinePosition(time);
+                    if (position < 2 || position > 98) continue;
+                    
+                    labels.push(
+                      <div
+                        key={`label-${time}`}
+                        className="absolute bottom-0 h-full flex flex-col items-center justify-center transform -translate-x-1/2"
+                        style={{ left: `${position}%` }}
+                      >
+                        <div className="h-2 w-px bg-foreground/40 mb-0.5" />
+                        <span className="text-[9px] font-mono text-muted-foreground leading-none">
+                          {formatTimeShort(time)}
+                        </span>
+                      </div>
+                    );
+                  }
+                  return labels;
+                })()}
+              </div>
+
+              {/* Clip markers area */}
+              <div className="absolute top-0 left-0 right-0 bottom-6">
+                {/* Pending marker start indicator */}
+                {pendingMarkerStart !== null && pendingMarkerStart >= visibleStart && pendingMarkerStart <= visibleEnd && (
+                  <div
+                    className="absolute top-0 bottom-0 w-0.5 bg-primary z-20"
+                    style={{ left: `${getTimelinePosition(pendingMarkerStart)}%` }}
+                  >
+                    <div className="absolute top-0 left-1/2 -translate-x-1/2 w-5 h-5 bg-primary rounded-b-lg flex items-center justify-center shadow-lg">
+                      <span className="text-[10px] text-primary-foreground font-bold">S</span>
+                    </div>
+                    {/* Dotted line showing potential range */}
+                    <div className="absolute top-5 bottom-0 left-1/2 -translate-x-1/2 w-px border-l border-dashed border-primary" />
+                  </div>
+                )}
+
+                {/* Clip markers */}
+                {markers.map((marker, idx) => {
+                  const leftPos = getTimelinePosition(marker.startTime);
+                  const rightPos = getTimelinePosition(marker.endTime);
+                  const width = rightPos - leftPos;
+                  
+                  // Only show if visible
+                  if (rightPos < 0 || leftPos > 100) return null;
+                  
                   return (
                     <div
-                      key={i}
-                      className="absolute bottom-0 text-[10px] text-muted-foreground transform -translate-x-1/2"
-                      style={{ left: `${i * 10}%` }}
+                      key={marker.id}
+                      className="absolute top-2 bottom-2 bg-primary/20 border-2 border-primary rounded-lg cursor-pointer hover:bg-primary/30 transition-colors group"
+                      style={{
+                        left: `${Math.max(0, leftPos)}%`,
+                        width: `${Math.min(100 - Math.max(0, leftPos), width)}%`,
+                        minWidth: "24px",
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        seekTo(marker.startTime);
+                      }}
                     >
-                      <div className="h-2 w-px bg-muted-foreground/30 mx-auto mb-0.5" />
-                      {formatTime(time)}
+                      {/* Clip label */}
+                      <div className="absolute inset-0 flex items-center justify-center overflow-hidden">
+                        <span className="text-[10px] text-primary font-semibold bg-background/80 px-1.5 py-0.5 rounded whitespace-nowrap">
+                          Clip {idx + 1}
+                        </span>
+                      </div>
+                      {/* Duration badge */}
+                      <div className="absolute -top-1 -right-1 bg-primary text-primary-foreground text-[8px] px-1 rounded opacity-0 group-hover:opacity-100 transition-opacity">
+                        {(marker.endTime - marker.startTime).toFixed(1)}s
+                      </div>
+                      {/* Resize handles */}
+                      <div className="absolute left-0 top-0 bottom-0 w-1 bg-primary rounded-l-lg cursor-ew-resize hover:bg-primary/80" />
+                      <div className="absolute right-0 top-0 bottom-0 w-1 bg-primary rounded-r-lg cursor-ew-resize hover:bg-primary/80" />
                     </div>
                   );
                 })}
-              </div>
 
-              {/* Pending marker start indicator */}
-              {pendingMarkerStart !== null && pendingMarkerStart >= visibleStart && pendingMarkerStart <= visibleEnd && (
-                <div
-                  className="absolute top-0 bottom-4 w-1 bg-primary z-20 animate-pulse"
-                  style={{ left: `${getTimelinePosition(pendingMarkerStart)}%` }}
-                >
-                  <div className="absolute -top-0 left-1/2 -translate-x-1/2 w-4 h-4 bg-primary rounded-full flex items-center justify-center">
-                    <span className="text-[8px] text-primary-foreground font-bold">S</span>
-                  </div>
-                </div>
-              )}
-
-              {/* Clip markers */}
-              {markers.map((marker, idx) => {
-                const leftPos = getTimelinePosition(marker.startTime);
-                const rightPos = getTimelinePosition(marker.endTime);
-                const width = rightPos - leftPos;
-                
-                // Only show if visible
-                if (rightPos < 0 || leftPos > 100) return null;
-                
-                return (
+                {/* Current time indicator (playhead) */}
+                {currentTime >= visibleStart && currentTime <= visibleEnd && (
                   <div
-                    key={marker.id}
-                    className="absolute top-2 h-8 bg-primary/30 border-2 border-primary rounded cursor-pointer hover:bg-primary/40 transition-colors"
-                    style={{
-                      left: `${Math.max(0, leftPos)}%`,
-                      width: `${Math.min(100 - Math.max(0, leftPos), width)}%`,
-                      minWidth: "20px",
-                    }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      seekTo(marker.startTime);
-                    }}
+                    className="absolute top-0 bottom-0 w-0.5 bg-destructive z-30 pointer-events-none"
+                    style={{ left: `${getTimelinePosition(currentTime)}%` }}
                   >
-                    <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-[10px] text-primary font-medium whitespace-nowrap">
-                      Clip {idx + 1}
-                    </span>
+                    <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[6px] border-r-[6px] border-t-[8px] border-l-transparent border-r-transparent border-t-destructive" />
+                    <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-destructive text-destructive-foreground text-[8px] px-1 py-0.5 rounded font-mono whitespace-nowrap">
+                      {formatTimeShort(currentTime)}
+                    </div>
                   </div>
-                );
-              })}
-
-              {/* Current time indicator */}
-              {currentTime >= visibleStart && currentTime <= visibleEnd && (
-                <div
-                  className="absolute top-0 bottom-4 w-0.5 bg-destructive z-10"
-                  style={{ left: `${getTimelinePosition(currentTime)}%` }}
-                >
-                  <div className="absolute -top-0 left-1/2 -translate-x-1/2 w-3 h-3 bg-destructive rounded-full" />
-                </div>
-              )}
+                )}
+              </div>
+              
+              {/* Snap indicator overlay */}
+              <div className="absolute top-1 right-1 bg-background/80 text-[9px] text-muted-foreground px-1.5 py-0.5 rounded flex items-center gap-1 pointer-events-none">
+                <div className="w-1.5 h-1.5 bg-primary rounded-full" />
+                Snap: 0.5s
+              </div>
             </div>
           </div>
 
