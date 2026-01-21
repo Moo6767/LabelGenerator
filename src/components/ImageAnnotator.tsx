@@ -36,6 +36,7 @@ interface ClipData {
   name: string;
   frames: { file: File; url: string; frameNumber: number }[];
   sourceVideo: string;
+  isManual?: boolean; // Flag for manually created clips - skip person detection
 }
 
 type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "move" | null;
@@ -63,6 +64,11 @@ export const ImageAnnotator = () => {
     originalDetection: Detection;
   } | null>(null);
   const [previewDetection, setPreviewDetection] = useState<Detection | null>(null);
+  
+  // Manual box drawing state
+  const [isDrawingBox, setIsDrawingBox] = useState(false);
+  const [drawingStart, setDrawingStart] = useState<{ x: number; y: number } | null>(null);
+  const [drawingPreview, setDrawingPreview] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
   const [customLabel, setCustomLabel] = useState<string>("");
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.5);
   const [detectAllClasses, setDetectAllClasses] = useState(true);
@@ -324,10 +330,26 @@ export const ImageAnnotator = () => {
         }
       });
       
+      // Draw manual box preview while drawing
+      if (drawingPreview) {
+        ctx.strokeStyle = "hsl(120, 70%, 50%)"; // Green for new boxes
+        ctx.lineWidth = 3;
+        ctx.setLineDash([8, 4]);
+        ctx.strokeRect(drawingPreview.x, drawingPreview.y, drawingPreview.width, drawingPreview.height);
+        ctx.setLineDash([]);
+        
+        // Draw "Neue Box" label
+        ctx.fillStyle = "hsl(120, 70%, 50%)";
+        ctx.fillRect(drawingPreview.x, drawingPreview.y - 25, 80, 25);
+        ctx.fillStyle = "white";
+        ctx.font = "14px system-ui, -apple-system, sans-serif";
+        ctx.fillText("Neue Box", drawingPreview.x + 6, drawingPreview.y - 8);
+      }
+      
       // Update scale after drawing
       setTimeout(updateScale, 10);
     };
-  }, [currentImage, selectedDetection, previewDetection, updateScale]);
+  }, [currentImage, selectedDetection, previewDetection, drawingPreview, updateScale]);
 
   useEffect(() => {
     drawCanvas();
@@ -397,16 +419,32 @@ export const ImageAnnotator = () => {
       }
     }
     
-    // Clicked outside all detections
+    // Clicked outside all detections - start drawing new box
     setSelectedDetection(null);
+    setIsDrawingBox(true);
+    setDrawingStart({ x, y });
+    setDrawingPreview({ x, y, width: 0, height: 0 });
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!resizing || !currentImage || selectedDetection === null || !canvasRef.current) return;
+    if (!canvasRef.current) return;
     
     const rect = canvasRef.current.getBoundingClientRect();
     const x = (e.clientX - rect.left) / scale;
     const y = (e.clientY - rect.top) / scale;
+    
+    // Handle drawing new box
+    if (isDrawingBox && drawingStart) {
+      const newX = Math.min(drawingStart.x, x);
+      const newY = Math.min(drawingStart.y, y);
+      const width = Math.abs(x - drawingStart.x);
+      const height = Math.abs(y - drawingStart.y);
+      setDrawingPreview({ x: newX, y: newY, width, height });
+      return;
+    }
+    
+    // Handle resizing existing detection
+    if (!resizing || !currentImage || selectedDetection === null) return;
     
     const dx = x - resizing.startX;
     const dy = y - resizing.startY;
@@ -450,7 +488,35 @@ export const ImageAnnotator = () => {
   };
 
   const handleCanvasMouseUp = () => {
-    // Commit the preview to actual state
+    // Finish drawing new box
+    if (isDrawingBox && drawingPreview && currentImage) {
+      // Only create box if it's big enough (min 30x30)
+      if (drawingPreview.width >= 30 && drawingPreview.height >= 30) {
+        const newDetection: Detection = {
+          x: drawingPreview.x,
+          y: drawingPreview.y,
+          width: drawingPreview.width,
+          height: drawingPreview.height,
+          label: "person", // Default label - user can change
+          confidence: 1.0, // Manual = 100% confidence
+        };
+        
+        const newImages = [...images];
+        newImages[currentIndex].detections.push(newDetection);
+        setImages(newImages);
+        
+        // Select the new detection
+        setSelectedDetection(newImages[currentIndex].detections.length - 1);
+        toast.success("Neue Box erstellt");
+      }
+      
+      setIsDrawingBox(false);
+      setDrawingStart(null);
+      setDrawingPreview(null);
+      return;
+    }
+    
+    // Commit the preview to actual state (for resizing)
     if (resizing && previewDetection && selectedDetection !== null) {
       const newImages = [...images];
       newImages[currentIndex].detections[selectedDetection] = previewDetection;
@@ -461,7 +527,9 @@ export const ImageAnnotator = () => {
   };
 
   const getCursorStyle = (): string => {
-    if (!currentImage || !canvasRef.current) return "default";
+    if (!currentImage || !canvasRef.current) return "crosshair"; // Default to crosshair for drawing
+    
+    if (isDrawingBox) return "crosshair";
     
     if (resizing) {
       switch (resizing.handle) {
@@ -480,11 +548,11 @@ export const ImageAnnotator = () => {
         case "move":
           return "move";
         default:
-          return "default";
+          return "crosshair";
       }
     }
     
-    return selectedDetection !== null ? "move" : "default";
+    return selectedDetection !== null ? "move" : "crosshair";
   };
 
   const handleDeleteDetection = (idx: number) => {
@@ -788,33 +856,41 @@ export const ImageAnnotator = () => {
       return;
     }
     
+    // Model is always required now since we run detection on all clips
     if (!model) {
       toast.error("KI-Modell wird noch geladen, bitte warten...");
       return;
     }
     
+    const hasManualClips = clips.some(c => c.isManual);
+    const hasAutoClips = clips.some(c => !c.isManual);
+    
     setIsProcessing(true);
     setActiveTab("annotator");
-    toast.loading("Clips werden analysiert (Personen-Erkennung)...");
+    
+    // Shorter toast messages
+    toast.loading("Analysiere Clips...");
     
     const allImages: ImageData[] = [];
     const blurryIndices: number[] = [];
     let totalFrames = clips.reduce((sum, c) => sum + c.frames.length, 0);
     let processedFrames = 0;
+    let manualFramesAdded = 0;
+    let autoFramesAdded = 0;
+    let skippedNoPersonFrames = 0;
     
     for (const clip of clips) {
       for (const frame of clip.frames) {
-        // Run person detection like video upload
+        // Run person detection for ALL clips (manual and auto)
         const detections = await detectObjects(frame.file, confidenceThreshold);
         const personDetections = detections.filter(d => d.label.toLowerCase() === 'person');
         
-        // Only keep frames with persons detected
-        if (personDetections.length > 0) {
+        // For MANUAL clips: KEEP ALL frames (even without persons), but still detect
+        if (clip.isManual) {
           const currentFrameIndex = allImages.length;
           
-          // Check for motion blur if enabled
-          if (filterMotionBlur) {
-            // Create temp canvas for blur detection
+          // Check for motion blur if enabled and persons detected
+          if (filterMotionBlur && personDetections.length > 0) {
             const img = new Image();
             img.src = frame.url;
             await new Promise<void>(resolve => {
@@ -847,10 +923,62 @@ export const ImageAnnotator = () => {
           allImages.push({
             file: frame.file,
             url: frame.url,
-            detections: personDetections,
+            detections: personDetections, // Include detected bounding boxes!
             frameNumber: frame.frameNumber,
             sourceVideo: clip.name
           });
+          manualFramesAdded++;
+        } else {
+          // For AUTO clips: run person detection like before
+          const detections = await detectObjects(frame.file, confidenceThreshold);
+          const personDetections = detections.filter(d => d.label.toLowerCase() === 'person');
+          
+          // Only keep frames with persons detected
+          if (personDetections.length > 0) {
+            const currentFrameIndex = allImages.length;
+            
+            // Check for motion blur if enabled
+            if (filterMotionBlur) {
+              const img = new Image();
+              img.src = frame.url;
+              await new Promise<void>(resolve => {
+                img.onload = () => resolve();
+                img.onerror = () => resolve();
+              });
+              
+              const canvas = document.createElement('canvas');
+              const ctx = canvas.getContext('2d');
+              if (ctx && img.width > 0) {
+                canvas.width = img.width;
+                canvas.height = img.height;
+                ctx.drawImage(img, 0, 0);
+                
+                let allBlurry = true;
+                for (const detection of personDetections) {
+                  const blurScore = detectMotionBlur(canvas, ctx, detection);
+                  if (blurScore >= blurThreshold) {
+                    allBlurry = false;
+                    break;
+                  }
+                }
+                
+                if (allBlurry) {
+                  blurryIndices.push(currentFrameIndex);
+                }
+              }
+            }
+            
+            allImages.push({
+              file: frame.file,
+              url: frame.url,
+              detections: personDetections,
+              frameNumber: frame.frameNumber,
+              sourceVideo: clip.name
+            });
+            autoFramesAdded++;
+          } else {
+            skippedNoPersonFrames++;
+          }
         }
         
         processedFrames++;
@@ -867,8 +995,22 @@ export const ImageAnnotator = () => {
     setIsProcessing(false);
     setExtractionProgress(0);
     
-    const skippedCount = totalFrames - allImages.length;
-    toast.success(`${allImages.length} Frames mit Personen geladen! (${skippedCount} ohne Person übersprungen, ${blurryIndices.length} unscharf markiert)`);
+    // Build detailed success message
+    const parts: string[] = [];
+    if (manualFramesAdded > 0) {
+      parts.push(`${manualFramesAdded} manuelle Frames`);
+    }
+    if (autoFramesAdded > 0) {
+      parts.push(`${autoFramesAdded} Auto-Frames mit Person`);
+    }
+    if (skippedNoPersonFrames > 0) {
+      parts.push(`${skippedNoPersonFrames} ohne Person übersprungen`);
+    }
+    if (blurryIndices.length > 0) {
+      parts.push(`${blurryIndices.length} unscharf markiert`);
+    }
+    
+    toast.success(`${allImages.length} Frames geladen! (${parts.join(', ')})`);
   };
 
   // ==================== ANNOTATOR FUNKTIONEN ====================
@@ -1851,8 +1993,10 @@ export const ImageAnnotator = () => {
                   </div>
                   <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 max-h-96 overflow-y-auto">
                     {clips.map((clip, idx) => (
-                      <div key={idx} className="bg-secondary rounded-lg p-3 text-center">
-                        <div className="text-xs text-muted-foreground mb-1">Clip {idx + 1}</div>
+                      <div key={idx} className={`rounded-lg p-3 text-center ${clip.isManual ? 'bg-primary/20 border border-primary/40' : 'bg-secondary'}`}>
+                        <div className="text-xs text-muted-foreground mb-1">
+                          Clip {idx + 1} {clip.isManual && <span className="text-primary">(manuell)</span>}
+                        </div>
                         <div className="font-medium text-sm truncate" title={clip.name}>{clip.name}</div>
                         <div className="text-xs text-primary mt-1">{clip.frames.length} Frames</div>
                         {clip.frames[0] && (
@@ -1873,9 +2017,19 @@ export const ImageAnnotator = () => {
             <ManualClipEditor
               framesPerClip={framesPerClip}
               frameInterval={clipFrameInterval}
+              confidenceThreshold={confidenceThreshold}
+              setConfidenceThreshold={setConfidenceThreshold}
+              boundingBoxPadding={boundingBoxPadding}
+              setBoundingBoxPadding={setBoundingBoxPadding}
+              filterMotionBlur={filterMotionBlur}
+              setFilterMotionBlur={setFilterMotionBlur}
+              blurThreshold={blurThreshold}
+              setBlurThreshold={setBlurThreshold}
               onClipsCreated={(newClips) => {
-                setClips(prev => [...prev, ...newClips]);
-                toast.success(`${newClips.length} manuelle Clips hinzugefügt!`);
+                // Mark manual clips with isManual flag - but still run person detection!
+                const markedClips = newClips.map(clip => ({ ...clip, isManual: true }));
+                setClips(prev => [...prev, ...markedClips]);
+                toast.success(`${newClips.length} manuelle Clips erstellt`);
               }}
             />
           </TabsContent>

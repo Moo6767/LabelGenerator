@@ -21,10 +21,30 @@ interface ManualClipData {
 interface ManualClipEditorProps {
   framesPerClip: number;
   frameInterval: number;
+  confidenceThreshold: number;
+  setConfidenceThreshold: (v: number) => void;
+  boundingBoxPadding: number;
+  setBoundingBoxPadding: (v: number) => void;
+  filterMotionBlur: boolean;
+  setFilterMotionBlur: (v: boolean) => void;
+  blurThreshold: number;
+  setBlurThreshold: (v: number) => void;
   onClipsCreated: (clips: ManualClipData[]) => void;
 }
 
-export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated }: ManualClipEditorProps) => {
+export const ManualClipEditor = ({ 
+  framesPerClip, 
+  frameInterval, 
+  confidenceThreshold,
+  setConfidenceThreshold,
+  boundingBoxPadding,
+  setBoundingBoxPadding,
+  filterMotionBlur,
+  setFilterMotionBlur,
+  blurThreshold,
+  setBlurThreshold,
+  onClipsCreated 
+}: ManualClipEditorProps) => {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [duration, setDuration] = useState(0);
@@ -290,24 +310,21 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
 
       const clips: ManualClipData[] = [];
       const totalMarkers = markers.length;
+      const MAX_FRAMES_PER_CLIP = 200; // Hard limit for YOWO compatibility
 
       for (let markerIdx = 0; markerIdx < markers.length; markerIdx++) {
         const marker = markers[markerIdx];
-        const clipDuration = marker.endTime - marker.startTime;
         const frameTimes: number[] = [];
         
-        // Calculate frame times based on frameInterval
+        // Calculate ALL frame times based on frameInterval (no framesPerClip limit for manual clips)
         for (let t = marker.startTime; t < marker.endTime; t += frameInterval) {
           frameTimes.push(t);
         }
         
-        // Limit to framesPerClip
-        const limitedFrameTimes = frameTimes.slice(0, framesPerClip);
+        const allFrames: { file: File; url: string; frameNumber: number }[] = [];
         
-        const frames: { file: File; url: string; frameNumber: number }[] = [];
-        
-        for (let frameIdx = 0; frameIdx < limitedFrameTimes.length; frameIdx++) {
-          const time = limitedFrameTimes[frameIdx];
+        for (let frameIdx = 0; frameIdx < frameTimes.length; frameIdx++) {
+          const time = frameTimes[frameIdx];
           
           // Seek to frame time
           video.currentTime = time;
@@ -328,19 +345,48 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
           const file = new File([blob], fileName, { type: "image/jpeg" });
           const url = URL.createObjectURL(blob);
           
-          frames.push({ file, url, frameNumber });
+          allFrames.push({ file, url, frameNumber });
           
           // Update progress
-          const overallProgress = ((markerIdx + (frameIdx + 1) / limitedFrameTimes.length) / totalMarkers) * 100;
+          const overallProgress = ((markerIdx + (frameIdx + 1) / frameTimes.length) / totalMarkers) * 100;
           setExtractionProgress(Math.round(overallProgress));
         }
         
-        const clipName = `clip_${String(markerIdx + 1).padStart(3, "0")}_${formatTime(marker.startTime).replace(":", "-")}`;
-        clips.push({
-          name: clipName,
-          frames,
-          sourceVideo: videoFile.name,
-        });
+        // Split into chunks of max 200 frames if needed
+        if (allFrames.length <= MAX_FRAMES_PER_CLIP) {
+          // Single clip
+          const clipName = `clip_${String(markerIdx + 1).padStart(3, "0")}_${formatTime(marker.startTime).replace(":", "-")}`;
+          clips.push({
+            name: clipName,
+            frames: allFrames,
+            sourceVideo: videoFile.name,
+          });
+        } else {
+          // Split into multiple clips (by half recursively or just chunks)
+          const numChunks = Math.ceil(allFrames.length / MAX_FRAMES_PER_CLIP);
+          const chunkSize = Math.ceil(allFrames.length / numChunks); // Distribute evenly
+          
+          for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
+            const start = chunkIdx * chunkSize;
+            const end = Math.min(start + chunkSize, allFrames.length);
+            const chunkFrames = allFrames.slice(start, end);
+            
+            // Renumber frames within each chunk starting from 1
+            const renumberedFrames = chunkFrames.map((f, idx) => ({
+              ...f,
+              frameNumber: idx + 1,
+            }));
+            
+            const clipName = `clip_${String(markerIdx + 1).padStart(3, "0")}_${formatTime(marker.startTime).replace(":", "-")}_part${chunkIdx + 1}`;
+            clips.push({
+              name: clipName,
+              frames: renumberedFrames,
+              sourceVideo: videoFile.name,
+            });
+          }
+          
+          toast.info(`Clip ${markerIdx + 1} hatte ${allFrames.length} Frames → in ${numChunks} Teile aufgeteilt`);
+        }
       }
 
       onClipsCreated(clips);
@@ -480,6 +526,84 @@ export const ManualClipEditor = ({ framesPerClip, frameInterval, onClipsCreated 
           <Video className="w-4 h-4 mr-2" />
           Video laden
         </Button>
+      </div>
+
+      {/* Detection Settings - Always visible */}
+      <div className="p-4 bg-secondary/50 rounded-lg space-y-4 mb-4">
+        <h4 className="text-sm font-semibold flex items-center gap-2">
+          Erkennungs-Einstellungen
+          <span className="text-xs text-muted-foreground font-normal">(werden beim Annotieren angewendet)</span>
+        </h4>
+        
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Confidence Threshold */}
+          <div>
+            <div className="flex justify-between text-sm mb-2">
+              <span className="text-muted-foreground">Konfidenz-Schwellenwert</span>
+              <span className="font-bold">{(confidenceThreshold * 100).toFixed(0)}%</span>
+            </div>
+            <Slider
+              value={[confidenceThreshold]}
+              onValueChange={([v]) => setConfidenceThreshold(v)}
+              min={0.1}
+              max={0.95}
+              step={0.05}
+            />
+            <p className="text-xs text-muted-foreground mt-1">
+              Niedrigerer Wert = mehr Erkennungen
+            </p>
+          </div>
+          
+          {/* Bounding Box Padding */}
+          <div>
+            <div className="flex justify-between text-sm mb-2">
+              <span className="text-muted-foreground">Bounding Box Padding</span>
+              <span className="font-bold">{boundingBoxPadding}%</span>
+            </div>
+            <Slider
+              value={[boundingBoxPadding]}
+              onValueChange={([v]) => setBoundingBoxPadding(v)}
+              min={0}
+              max={50}
+              step={5}
+            />
+            <p className="text-xs text-muted-foreground mt-1">
+              Erweitert Boxen für Werkzeuge
+            </p>
+          </div>
+        </div>
+        
+        {/* Motion Blur Filter */}
+        <div className="pt-2 border-t border-border/50">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm text-muted-foreground">Bewegungsunschärfe filtern</span>
+            <Button
+              variant={filterMotionBlur ? "default" : "outline"}
+              size="sm"
+              onClick={() => setFilterMotionBlur(!filterMotionBlur)}
+            >
+              {filterMotionBlur ? "Aktiv" : "Aus"}
+            </Button>
+          </div>
+          {filterMotionBlur && (
+            <div className="mt-2">
+              <div className="flex justify-between text-sm mb-2">
+                <span className="text-muted-foreground">Blur-Schwellenwert</span>
+                <span className="font-bold">{blurThreshold}</span>
+              </div>
+              <Slider
+                value={[blurThreshold]}
+                onValueChange={([v]) => setBlurThreshold(v)}
+                min={50}
+                max={300}
+                step={10}
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Höher = weniger streng
+              </p>
+            </div>
+          )}
+        </div>
       </div>
 
       {!videoUrl ? (
