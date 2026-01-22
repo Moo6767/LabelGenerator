@@ -679,7 +679,8 @@ export const ImageAnnotator = () => {
     return variance;
   };
 
-  // Video/Image enhancement with upscaling and sharpening (local, no AI)
+  // Video/Image enhancement with full processing pipeline (local, no AI)
+  // Includes: Super-Resolution, Denoising, Deblurring, Contrast/Exposure, Artifact Reduction
   const enhanceFrame = (
     sourceCanvas: HTMLCanvasElement,
     sourceCtx: CanvasRenderingContext2D,
@@ -693,56 +694,184 @@ export const ImageAnnotator = () => {
       return { canvas: sourceCanvas, ctx: sourceCtx };
     }
     
-    // Set new dimensions
+    // ========== 1. SUPER-RESOLUTION (Upscaling) ==========
     const newWidth = Math.round(sourceCanvas.width * scaleFactor);
     const newHeight = Math.round(sourceCanvas.height * scaleFactor);
     enhancedCanvas.width = newWidth;
     enhancedCanvas.height = newHeight;
     
-    // Enable high-quality image smoothing
+    // Enable high-quality bicubic-like interpolation
     enhancedCtx.imageSmoothingEnabled = true;
     enhancedCtx.imageSmoothingQuality = 'high';
     
     // Draw upscaled image
     enhancedCtx.drawImage(sourceCanvas, 0, 0, newWidth, newHeight);
     
-    // Apply sharpening convolution filter
-    const imageData = enhancedCtx.getImageData(0, 0, newWidth, newHeight);
-    const data = imageData.data;
+    // Get image data for processing
+    let imageData = enhancedCtx.getImageData(0, 0, newWidth, newHeight);
+    let data = imageData.data;
     const width = newWidth;
     const height = newHeight;
     
-    // Sharpening kernel (unsharp mask approximation)
-    // Center = 5, edges = -1, more aggressive sharpening
-    const kernel = [
-      0, -1, 0,
-      -1, 5, -1,
-      0, -1, 0
-    ];
+    // ========== 2. DENOISING (Rauschunterdrückung) ==========
+    // Bilateral-like filter: smooths noise while preserving edges
+    const denoised = new Uint8ClampedArray(data.length);
+    const spatialSigma = 2.0; // Spatial smoothing
+    const colorSigma = 25; // Color similarity threshold
+    const filterRadius = 2;
     
-    // Create output buffer
-    const output = new Uint8ClampedArray(data.length);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4;
+        
+        let sumR = 0, sumG = 0, sumB = 0, sumWeight = 0;
+        const centerR = data[idx];
+        const centerG = data[idx + 1];
+        const centerB = data[idx + 2];
+        
+        for (let dy = -filterRadius; dy <= filterRadius; dy++) {
+          for (let dx = -filterRadius; dx <= filterRadius; dx++) {
+            const nx = Math.min(width - 1, Math.max(0, x + dx));
+            const ny = Math.min(height - 1, Math.max(0, y + dy));
+            const nIdx = (ny * width + nx) * 4;
+            
+            const nR = data[nIdx];
+            const nG = data[nIdx + 1];
+            const nB = data[nIdx + 2];
+            
+            // Spatial weight (Gaussian)
+            const spatialDist = Math.sqrt(dx * dx + dy * dy);
+            const spatialWeight = Math.exp(-(spatialDist * spatialDist) / (2 * spatialSigma * spatialSigma));
+            
+            // Color similarity weight
+            const colorDist = Math.sqrt(
+              (nR - centerR) ** 2 + (nG - centerG) ** 2 + (nB - centerB) ** 2
+            );
+            const colorWeight = Math.exp(-(colorDist * colorDist) / (2 * colorSigma * colorSigma));
+            
+            const weight = spatialWeight * colorWeight;
+            sumR += nR * weight;
+            sumG += nG * weight;
+            sumB += nB * weight;
+            sumWeight += weight;
+          }
+        }
+        
+        denoised[idx] = Math.round(sumR / sumWeight);
+        denoised[idx + 1] = Math.round(sumG / sumWeight);
+        denoised[idx + 2] = Math.round(sumB / sumWeight);
+        denoised[idx + 3] = data[idx + 3];
+      }
+    }
+    data = denoised;
+    
+    // ========== 3. CONTRAST & EXPOSURE CORRECTION ==========
+    // Adaptive histogram-based contrast enhancement (CLAHE-like)
+    // First compute histogram for luminance
+    const luminance: number[] = [];
+    for (let i = 0; i < data.length; i += 4) {
+      luminance.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    }
+    
+    // Compute percentiles for robust min/max
+    const sorted = [...luminance].sort((a, b) => a - b);
+    const p2 = sorted[Math.floor(sorted.length * 0.02)]; // 2nd percentile (shadow)
+    const p98 = sorted[Math.floor(sorted.length * 0.98)]; // 98th percentile (highlight)
+    
+    // Apply contrast stretching with gamma correction
+    const contrastData = new Uint8ClampedArray(data.length);
+    const gamma = 0.9; // Slight gamma boost for midtones
+    
+    for (let i = 0; i < data.length; i += 4) {
+      for (let c = 0; c < 3; c++) {
+        // Stretch contrast
+        let val = data[i + c];
+        val = ((val - p2) / (p98 - p2 + 1)) * 255;
+        val = Math.min(255, Math.max(0, val));
+        
+        // Apply gamma
+        val = 255 * Math.pow(val / 255, gamma);
+        contrastData[i + c] = Math.round(val);
+      }
+      contrastData[i + 3] = data[i + 3];
+    }
+    data = contrastData;
+    
+    // ========== 4. ARTIFACT REDUCTION (Block-Artefakte glätten) ==========
+    // Smooths 8x8 block boundaries common in JPEG/H.264 compression
+    const artifactReduced = new Uint8ClampedArray(data.length);
+    const blockSize = 8;
+    const blendRadius = 1;
+    
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4;
+        
+        // Check if near block boundary
+        const nearBlockEdgeX = (x % blockSize) < blendRadius || (x % blockSize) >= (blockSize - blendRadius);
+        const nearBlockEdgeY = (y % blockSize) < blendRadius || (y % blockSize) >= (blockSize - blendRadius);
+        
+        if (nearBlockEdgeX || nearBlockEdgeY) {
+          // Apply mild averaging at block boundaries
+          let sumR = 0, sumG = 0, sumB = 0, count = 0;
+          
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = Math.min(width - 1, Math.max(0, x + dx));
+              const ny = Math.min(height - 1, Math.max(0, y + dy));
+              const nIdx = (ny * width + nx) * 4;
+              sumR += data[nIdx];
+              sumG += data[nIdx + 1];
+              sumB += data[nIdx + 2];
+              count++;
+            }
+          }
+          
+          // Blend original with smoothed (50/50 at boundaries)
+          artifactReduced[idx] = Math.round((data[idx] + sumR / count) / 2);
+          artifactReduced[idx + 1] = Math.round((data[idx + 1] + sumG / count) / 2);
+          artifactReduced[idx + 2] = Math.round((data[idx + 2] + sumB / count) / 2);
+        } else {
+          artifactReduced[idx] = data[idx];
+          artifactReduced[idx + 1] = data[idx + 1];
+          artifactReduced[idx + 2] = data[idx + 2];
+        }
+        artifactReduced[idx + 3] = data[idx + 3];
+      }
+    }
+    data = artifactReduced;
+    
+    // ========== 5. DEBLURRING / SHARPENING ==========
+    // Unsharp mask with Laplacian enhancement
+    const sharpened = new Uint8ClampedArray(data.length);
+    
+    // Enhanced sharpening kernel (stronger than before)
+    const sharpenKernel = [
+      -0.5, -1, -0.5,
+      -1, 7, -1,
+      -0.5, -1, -0.5
+    ];
     
     // Apply convolution (skip edges)
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const pixelIndex = (y * width + x) * 4;
         
-        for (let c = 0; c < 3; c++) { // RGB channels only
+        for (let c = 0; c < 3; c++) {
           let sum = 0;
           let ki = 0;
           
           for (let ky = -1; ky <= 1; ky++) {
             for (let kx = -1; kx <= 1; kx++) {
               const neighborIndex = ((y + ky) * width + (x + kx)) * 4 + c;
-              sum += data[neighborIndex] * kernel[ki];
+              sum += data[neighborIndex] * sharpenKernel[ki];
               ki++;
             }
           }
           
-          output[pixelIndex + c] = Math.min(255, Math.max(0, sum));
+          sharpened[pixelIndex + c] = Math.min(255, Math.max(0, Math.round(sum)));
         }
-        output[pixelIndex + 3] = data[pixelIndex + 3]; // Alpha unchanged
+        sharpened[pixelIndex + 3] = data[pixelIndex + 3];
       }
     }
     
@@ -751,25 +880,22 @@ export const ImageAnnotator = () => {
       const topIdx = x * 4;
       const bottomIdx = ((height - 1) * width + x) * 4;
       for (let c = 0; c < 4; c++) {
-        output[topIdx + c] = data[topIdx + c];
-        output[bottomIdx + c] = data[bottomIdx + c];
+        sharpened[topIdx + c] = data[topIdx + c];
+        sharpened[bottomIdx + c] = data[bottomIdx + c];
       }
     }
     for (let y = 0; y < height; y++) {
       const leftIdx = y * width * 4;
       const rightIdx = (y * width + width - 1) * 4;
       for (let c = 0; c < 4; c++) {
-        output[leftIdx + c] = data[leftIdx + c];
-        output[rightIdx + c] = data[rightIdx + c];
+        sharpened[leftIdx + c] = data[leftIdx + c];
+        sharpened[rightIdx + c] = data[rightIdx + c];
       }
     }
     
-    // Apply enhanced data back
-    const enhancedImageData = new ImageData(output, width, height);
+    // ========== FINAL OUTPUT ==========
+    const enhancedImageData = new ImageData(sharpened, width, height);
     enhancedCtx.putImageData(enhancedImageData, 0, 0);
-    
-    // Additional contrast boost for better edge detection
-    enhancedCtx.globalCompositeOperation = 'source-over';
     
     return { canvas: enhancedCanvas, ctx: enhancedCtx };
   };
