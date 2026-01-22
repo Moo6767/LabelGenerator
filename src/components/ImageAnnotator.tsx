@@ -70,7 +70,7 @@ export const ImageAnnotator = () => {
   const [drawingStart, setDrawingStart] = useState<{ x: number; y: number } | null>(null);
   const [drawingPreview, setDrawingPreview] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
   const [customLabel, setCustomLabel] = useState<string>("");
-  const [confidenceThreshold, setConfidenceThreshold] = useState(0.5);
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.20); // Lowered for better detection
   const [detectAllClasses, setDetectAllClasses] = useState(true);
   const [frameInterval, setFrameInterval] = useState(1); // Extract every N seconds
   const [extractionProgress, setExtractionProgress] = useState(0);
@@ -565,6 +565,163 @@ export const ImageAnnotator = () => {
     toast.success("Erkennung gelöscht");
   };
 
+  // Multi-Pass Detection: runs detection at multiple scales and merges results
+  // This dramatically improves detection for low-quality video or small/distant persons
+  const detectObjectsMultiPass = async (
+    canvas: HTMLCanvasElement,
+    ctx: CanvasRenderingContext2D,
+    threshold: number,
+    originalWidth: number,
+    originalHeight: number
+  ): Promise<Detection[]> => {
+    if (!model) return [];
+    
+    const allDetections: Detection[] = [];
+    
+    // PASS 1: Original scale detection
+    try {
+      const preds1 = await model.detect(canvas);
+      for (const pred of preds1) {
+        if (pred.score >= threshold) {
+          const padding = pred.bbox[2] * (boundingBoxPadding / 100);
+          allDetections.push({
+            x: Math.max(0, pred.bbox[0] - padding),
+            y: Math.max(0, pred.bbox[1]),
+            width: Math.min(pred.bbox[2] + padding * 2, originalWidth),
+            height: Math.min(pred.bbox[3], originalHeight),
+            label: pred.class.charAt(0).toUpperCase() + pred.class.slice(1),
+            confidence: pred.score,
+          });
+        }
+      }
+    } catch (e) {
+      console.warn("Pass 1 failed:", e);
+    }
+    
+    // PASS 2: Upscaled detection (1.5x) - catches more details
+    try {
+      const scale2 = 1.5;
+      const upCanvas = document.createElement('canvas');
+      const upCtx = upCanvas.getContext('2d');
+      if (upCtx) {
+        upCanvas.width = Math.round(originalWidth * scale2);
+        upCanvas.height = Math.round(originalHeight * scale2);
+        upCtx.imageSmoothingEnabled = true;
+        upCtx.imageSmoothingQuality = 'high';
+        upCtx.drawImage(canvas, 0, 0, upCanvas.width, upCanvas.height);
+        
+        const preds2 = await model.detect(upCanvas);
+        for (const pred of preds2) {
+          if (pred.score >= threshold) {
+            const padding = (pred.bbox[2] / scale2) * (boundingBoxPadding / 100);
+            allDetections.push({
+              x: Math.max(0, (pred.bbox[0] / scale2) - padding),
+              y: Math.max(0, pred.bbox[1] / scale2),
+              width: Math.min((pred.bbox[2] / scale2) + padding * 2, originalWidth),
+              height: Math.min(pred.bbox[3] / scale2, originalHeight),
+              label: pred.class.charAt(0).toUpperCase() + pred.class.slice(1),
+              confidence: pred.score * 0.95, // Slightly lower weight
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Pass 2 failed:", e);
+    }
+    
+    // PASS 3: Tile-based detection for small/distant persons
+    // Divides frame into overlapping tiles to catch small objects
+    try {
+      const tileSize = 400; // Optimal for COCO-SSD
+      const overlap = 100; // Overlap to avoid cutting persons at edges
+      
+      for (let tileY = 0; tileY < originalHeight; tileY += (tileSize - overlap)) {
+        for (let tileX = 0; tileX < originalWidth; tileX += (tileSize - overlap)) {
+          const tw = Math.min(tileSize, originalWidth - tileX);
+          const th = Math.min(tileSize, originalHeight - tileY);
+          
+          if (tw < 100 || th < 100) continue; // Skip tiny edge tiles
+          
+          const tileCanvas = document.createElement('canvas');
+          const tileCtx = tileCanvas.getContext('2d');
+          if (!tileCtx) continue;
+          
+          // Extract tile and upscale 2x for better small-object detection
+          const tileScale = 2;
+          tileCanvas.width = tw * tileScale;
+          tileCanvas.height = th * tileScale;
+          tileCtx.imageSmoothingEnabled = true;
+          tileCtx.imageSmoothingQuality = 'high';
+          tileCtx.drawImage(canvas, tileX, tileY, tw, th, 0, 0, tileCanvas.width, tileCanvas.height);
+          
+          const tilePreds = await model.detect(tileCanvas);
+          for (const pred of tilePreds) {
+            if (pred.score >= threshold) {
+              // Map back to original coordinates
+              const realX = tileX + (pred.bbox[0] / tileScale);
+              const realY = tileY + (pred.bbox[1] / tileScale);
+              const realW = pred.bbox[2] / tileScale;
+              const realH = pred.bbox[3] / tileScale;
+              
+              const padding = realW * (boundingBoxPadding / 100);
+              allDetections.push({
+                x: Math.max(0, realX - padding),
+                y: Math.max(0, realY),
+                width: Math.min(realW + padding * 2, originalWidth - realX),
+                height: Math.min(realH, originalHeight - realY),
+                label: pred.class.charAt(0).toUpperCase() + pred.class.slice(1),
+                confidence: pred.score * 0.9, // Lower weight for tile detections
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Pass 3 (tiles) failed:", e);
+    }
+    
+    return allDetections;
+  };
+  
+  // Non-Maximum Suppression: removes duplicate/overlapping detections
+  const nonMaxSuppression = (detections: Detection[], iouThreshold: number = 0.5): Detection[] => {
+    if (detections.length === 0) return [];
+    
+    // Sort by confidence (highest first)
+    const sorted = [...detections].sort((a, b) => b.confidence - a.confidence);
+    const kept: Detection[] = [];
+    
+    for (const det of sorted) {
+      let dominated = false;
+      
+      for (const existing of kept) {
+        // Calculate IoU (Intersection over Union)
+        const x1 = Math.max(det.x, existing.x);
+        const y1 = Math.max(det.y, existing.y);
+        const x2 = Math.min(det.x + det.width, existing.x + existing.width);
+        const y2 = Math.min(det.y + det.height, existing.y + existing.height);
+        
+        const intersection = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+        const areaA = det.width * det.height;
+        const areaB = existing.width * existing.height;
+        const union = areaA + areaB - intersection;
+        
+        const iou = intersection / union;
+        
+        if (iou > iouThreshold) {
+          dominated = true;
+          break;
+        }
+      }
+      
+      if (!dominated) {
+        kept.push(det);
+      }
+    }
+    
+    return kept;
+  };
+
   const detectObjects = async (imageFile: File, threshold: number = 0.5): Promise<Detection[]> => {
     if (!model) {
       console.log("Model not loaded yet");
@@ -573,13 +730,15 @@ export const ImageAnnotator = () => {
 
     return new Promise((resolve) => {
       const img = new Image();
-      img.src = URL.createObjectURL(imageFile);
+      const url = URL.createObjectURL(imageFile);
+      img.src = url;
       
       img.onload = async () => {
         try {
           const canvas = document.createElement('canvas');
           const ctx = canvas.getContext('2d');
           if (!ctx) {
+            URL.revokeObjectURL(url);
             resolve([]);
             return;
           }
@@ -587,46 +746,29 @@ export const ImageAnnotator = () => {
           canvas.width = img.width;
           canvas.height = img.height;
           ctx.drawImage(img, 0, 0);
-
-          const predictions = await model.detect(canvas);
-          console.log("Raw predictions:", predictions);
           
-          // Detect all classes or filter to person only
-          const detections = predictions
-            .filter(pred => pred.score >= threshold)
-            .map(pred => {
-              // Erweitere Bounding Box um einstellbaren Prozentsatz links/rechts für Werkzeuge in der Hand
-              const padding = pred.bbox[2] * (boundingBoxPadding / 100);
-              
-              const x = Math.max(0, pred.bbox[0] - padding);
-              const y = Math.max(0, pred.bbox[1]);
-              const width = Math.min(pred.bbox[2] + padding * 2, img.width - x);
-              const height = Math.min(pred.bbox[3], img.height - y);
-              
-              // Capitalize first letter of class name
-              const label = pred.class.charAt(0).toUpperCase() + pred.class.slice(1);
-              
-              return {
-                x,
-                y,
-                width,
-                height,
-                label,
-                confidence: pred.score,
-              };
-            })
+          // Use aggressive multi-pass detection
+          const allDetections = await detectObjectsMultiPass(
+            canvas, ctx, threshold, img.width, img.height
+          );
+          
+          // Remove duplicates using NMS
+          const finalDetections = nonMaxSuppression(allDetections, 0.4)
             .filter(det => det.width > 0 && det.height > 0);
           
-          console.log("Valid detections:", detections);
-          resolve(detections);
+          console.log(`Multi-pass: ${allDetections.length} raw → ${finalDetections.length} after NMS`);
+          URL.revokeObjectURL(url);
+          resolve(finalDetections);
         } catch (error) {
           console.error("Detection error:", error);
+          URL.revokeObjectURL(url);
           resolve([]);
         }
       };
       
       img.onerror = () => {
         console.error("Image load error");
+        URL.revokeObjectURL(url);
         resolve([]);
       };
     });

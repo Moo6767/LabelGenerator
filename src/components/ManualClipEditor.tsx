@@ -67,6 +67,13 @@ export const ManualClipEditor = ({
   // Pending marker start time for two-click marker creation
   const [pendingMarkerStart, setPendingMarkerStart] = useState<number | null>(null);
   
+  // Smooth frame stepping state
+  const [isKeyHeld, setIsKeyHeld] = useState(false);
+  const keyHeldDirection = useRef<1 | -1 | null>(null);
+  const frameRequestRef = useRef<number | null>(null);
+  const lastFrameTime = useRef<number>(0);
+  const stepAccumulator = useRef<number>(0);
+  
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -173,16 +180,78 @@ export const ManualClipEditor = ({
   // Frame step (assumes ~30fps, so 1 frame ≈ 0.033s)
   const frameStep = 1 / 30; // ~33ms per frame
   
-  const stepFrame = (direction: 1 | -1) => {
+  // Instant single frame step - directly manipulates video without waiting for state
+  const stepFrameInstant = useCallback((direction: 1 | -1) => {
     if (!videoRef.current) return;
     // Pause video when stepping
-    if (isPlaying) {
+    if (videoRef.current.paused === false) {
       videoRef.current.pause();
       setIsPlaying(false);
     }
-    const newTime = currentTime + (direction * frameStep);
-    seekTo(newTime);
-  };
+    const newTime = Math.max(0, Math.min(videoRef.current.currentTime + (direction * frameStep), duration));
+    videoRef.current.currentTime = newTime;
+    // Don't call setCurrentTime here - let the timeupdate event handle it for smoother updates
+  }, [duration, frameStep]);
+
+  // Continuous frame stepping loop for held keys - runs at 60fps for smooth scrubbing
+  const continuousFrameStep = useCallback((timestamp: number) => {
+    if (!videoRef.current || keyHeldDirection.current === null) return;
+    
+    const deltaTime = timestamp - lastFrameTime.current;
+    lastFrameTime.current = timestamp;
+    
+    // Accumulate time for frame steps - faster stepping: 10 frames per second base, accelerates over time
+    const framesPerSecond = Math.min(30, 10 + stepAccumulator.current * 2); // Accelerate from 10 to 30 fps
+    stepAccumulator.current += deltaTime / 1000;
+    
+    const timeStep = (deltaTime / 1000) * framesPerSecond * frameStep;
+    const newTime = Math.max(0, Math.min(
+      videoRef.current.currentTime + (keyHeldDirection.current * timeStep),
+      duration
+    ));
+    
+    videoRef.current.currentTime = newTime;
+    setCurrentTime(newTime);
+    
+    // Continue loop
+    frameRequestRef.current = requestAnimationFrame(continuousFrameStep);
+  }, [duration, frameStep]);
+
+  // Start continuous stepping
+  const startContinuousStep = useCallback((direction: 1 | -1) => {
+    if (frameRequestRef.current) return; // Already running
+    
+    if (videoRef.current && !videoRef.current.paused) {
+      videoRef.current.pause();
+      setIsPlaying(false);
+    }
+    
+    keyHeldDirection.current = direction;
+    stepAccumulator.current = 0;
+    lastFrameTime.current = performance.now();
+    setIsKeyHeld(true);
+    
+    // Do one immediate step
+    stepFrameInstant(direction);
+    
+    // Start continuous loop after a short delay (for key repeat feel)
+    setTimeout(() => {
+      if (keyHeldDirection.current === direction) {
+        frameRequestRef.current = requestAnimationFrame(continuousFrameStep);
+      }
+    }, 150);
+  }, [stepFrameInstant, continuousFrameStep]);
+
+  // Stop continuous stepping
+  const stopContinuousStep = useCallback(() => {
+    if (frameRequestRef.current) {
+      cancelAnimationFrame(frameRequestRef.current);
+      frameRequestRef.current = null;
+    }
+    keyHeldDirection.current = null;
+    stepAccumulator.current = 0;
+    setIsKeyHeld(false);
+  }, []);
 
   // Snap time to grid (0.5 second intervals)
   const snapToGrid = (time: number): number => {
@@ -429,6 +498,15 @@ export const ManualClipEditor = ({
     }
   }, [currentTime, duration, zoomLevel]);
 
+  // Cleanup frame stepping on unmount
+  useEffect(() => {
+    return () => {
+      if (frameRequestRef.current) {
+        cancelAnimationFrame(frameRequestRef.current);
+      }
+    };
+  }, []);
+
   // Keyboard shortcuts for frame stepping and marker creation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -437,14 +515,20 @@ export const ManualClipEditor = ({
       // Skip if user is typing in an input
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       
+      // Ignore key repeats for arrow keys - we handle continuous stepping ourselves
+      if (e.repeat && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === ',' || e.key === '.')) {
+        e.preventDefault();
+        return;
+      }
+      
       switch (e.key) {
         case 'ArrowLeft':
           e.preventDefault();
-          stepFrame(-1);
+          startContinuousStep(-1);
           break;
         case 'ArrowRight':
           e.preventDefault();
-          stepFrame(1);
+          startContinuousStep(1);
           break;
         case ' ':
           e.preventDefault();
@@ -453,11 +537,11 @@ export const ManualClipEditor = ({
           break;
         case ',':
           e.preventDefault();
-          stepFrame(-1);
+          startContinuousStep(-1);
           break;
         case '.':
           e.preventDefault();
-          stepFrame(1);
+          startContinuousStep(1);
           break;
         case 'p':
         case 'P':
@@ -473,9 +557,20 @@ export const ManualClipEditor = ({
       }
     };
 
+    const handleKeyUp = (e: KeyboardEvent) => {
+      // Stop continuous stepping when key is released
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === ',' || e.key === '.') {
+        stopContinuousStep();
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [videoUrl, currentTime, isPlaying, duration, pendingMarkerStart]);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [videoUrl, isPlaying, duration, pendingMarkerStart, startContinuousStep, stopContinuousStep]);
 
   // Handle space key for marker creation
   const handleSpaceMarker = () => {
@@ -680,7 +775,7 @@ export const ManualClipEditor = ({
           <div className="flex items-center gap-2">
             {/* Frame back */}
             <Button 
-              onClick={() => stepFrame(-1)} 
+              onClick={() => stepFrameInstant(-1)}
               variant="outline" 
               size="sm"
               title="1 Frame zurück (← oder ,)"
@@ -695,7 +790,7 @@ export const ManualClipEditor = ({
             
             {/* Frame forward */}
             <Button 
-              onClick={() => stepFrame(1)} 
+              onClick={() => stepFrameInstant(1)}
               variant="outline" 
               size="sm"
               title="1 Frame vor (→ oder .)"
