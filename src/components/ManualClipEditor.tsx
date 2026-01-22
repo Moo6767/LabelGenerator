@@ -29,6 +29,10 @@ interface ManualClipEditorProps {
   setFilterMotionBlur: (v: boolean) => void;
   blurThreshold: number;
   setBlurThreshold: (v: number) => void;
+  enhanceVideo: boolean;
+  setEnhanceVideo: (v: boolean) => void;
+  enhanceScale: number;
+  setEnhanceScale: (v: number) => void;
   onClipsCreated: (clips: ManualClipData[]) => void;
 }
 
@@ -43,6 +47,10 @@ export const ManualClipEditor = ({
   setFilterMotionBlur,
   blurThreshold,
   setBlurThreshold,
+  enhanceVideo,
+  setEnhanceVideo,
+  enhanceScale,
+  setEnhanceScale,
   onClipsCreated 
 }: ManualClipEditorProps) => {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -600,6 +608,41 @@ export const ManualClipEditor = ({
               />
               <p className="text-xs text-muted-foreground mt-1">
                 Höher = weniger streng
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Video Enhancement / Upscaling */}
+        <div className="pt-2 border-t border-border/50">
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              <span className="text-sm text-muted-foreground">Video-Verbesserung (Upscaling)</span>
+              <p className="text-xs text-muted-foreground">Verbessert schlechte Videoqualität für bessere Erkennung</p>
+            </div>
+            <Button
+              variant={enhanceVideo ? "default" : "outline"}
+              size="sm"
+              onClick={() => setEnhanceVideo(!enhanceVideo)}
+            >
+              {enhanceVideo ? "Aktiv" : "Aus"}
+            </Button>
+          </div>
+          {enhanceVideo && (
+            <div className="mt-2">
+              <div className="flex justify-between text-sm mb-2">
+                <span className="text-muted-foreground">Skalierungsfaktor</span>
+                <span className="font-bold">{enhanceScale}x</span>
+              </div>
+              <Slider
+                value={[enhanceScale]}
+                onValueChange={([v]) => setEnhanceScale(v)}
+                min={1.5}
+                max={4}
+                step={0.5}
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Höher = bessere Details, aber langsamer. 2x empfohlen.
               </p>
             </div>
           )}

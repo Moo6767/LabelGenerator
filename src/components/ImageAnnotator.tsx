@@ -84,6 +84,8 @@ export const ImageAnnotator = () => {
   const [blurThreshold, setBlurThreshold] = useState(100); // Laplacian variance threshold
   const [chunkDuration, setChunkDuration] = useState(10); // Chunk duration in minutes (1-15)
   const [gpuBackend, setGpuBackend] = useState<string>("loading"); // Track which backend is active
+  const [enhanceVideo, setEnhanceVideo] = useState(false); // Video upscaling/enhancement
+  const [enhanceScale, setEnhanceScale] = useState(2); // Upscaling factor (1.5x - 4x)
   
   // Export settings
   const [exportOnlyLabeled, setExportOnlyLabeled] = useState(true); // Only export labeled frames
@@ -677,6 +679,101 @@ export const ImageAnnotator = () => {
     return variance;
   };
 
+  // Video/Image enhancement with upscaling and sharpening (local, no AI)
+  const enhanceFrame = (
+    sourceCanvas: HTMLCanvasElement,
+    sourceCtx: CanvasRenderingContext2D,
+    scaleFactor: number
+  ): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } => {
+    // Create upscaled canvas
+    const enhancedCanvas = document.createElement('canvas');
+    const enhancedCtx = enhancedCanvas.getContext('2d', { willReadFrequently: true });
+    
+    if (!enhancedCtx) {
+      return { canvas: sourceCanvas, ctx: sourceCtx };
+    }
+    
+    // Set new dimensions
+    const newWidth = Math.round(sourceCanvas.width * scaleFactor);
+    const newHeight = Math.round(sourceCanvas.height * scaleFactor);
+    enhancedCanvas.width = newWidth;
+    enhancedCanvas.height = newHeight;
+    
+    // Enable high-quality image smoothing
+    enhancedCtx.imageSmoothingEnabled = true;
+    enhancedCtx.imageSmoothingQuality = 'high';
+    
+    // Draw upscaled image
+    enhancedCtx.drawImage(sourceCanvas, 0, 0, newWidth, newHeight);
+    
+    // Apply sharpening convolution filter
+    const imageData = enhancedCtx.getImageData(0, 0, newWidth, newHeight);
+    const data = imageData.data;
+    const width = newWidth;
+    const height = newHeight;
+    
+    // Sharpening kernel (unsharp mask approximation)
+    // Center = 5, edges = -1, more aggressive sharpening
+    const kernel = [
+      0, -1, 0,
+      -1, 5, -1,
+      0, -1, 0
+    ];
+    
+    // Create output buffer
+    const output = new Uint8ClampedArray(data.length);
+    
+    // Apply convolution (skip edges)
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const pixelIndex = (y * width + x) * 4;
+        
+        for (let c = 0; c < 3; c++) { // RGB channels only
+          let sum = 0;
+          let ki = 0;
+          
+          for (let ky = -1; ky <= 1; ky++) {
+            for (let kx = -1; kx <= 1; kx++) {
+              const neighborIndex = ((y + ky) * width + (x + kx)) * 4 + c;
+              sum += data[neighborIndex] * kernel[ki];
+              ki++;
+            }
+          }
+          
+          output[pixelIndex + c] = Math.min(255, Math.max(0, sum));
+        }
+        output[pixelIndex + 3] = data[pixelIndex + 3]; // Alpha unchanged
+      }
+    }
+    
+    // Copy edges (unprocessed)
+    for (let x = 0; x < width; x++) {
+      const topIdx = x * 4;
+      const bottomIdx = ((height - 1) * width + x) * 4;
+      for (let c = 0; c < 4; c++) {
+        output[topIdx + c] = data[topIdx + c];
+        output[bottomIdx + c] = data[bottomIdx + c];
+      }
+    }
+    for (let y = 0; y < height; y++) {
+      const leftIdx = y * width * 4;
+      const rightIdx = (y * width + width - 1) * 4;
+      for (let c = 0; c < 4; c++) {
+        output[leftIdx + c] = data[leftIdx + c];
+        output[rightIdx + c] = data[rightIdx + c];
+      }
+    }
+    
+    // Apply enhanced data back
+    const enhancedImageData = new ImageData(output, width, height);
+    enhancedCtx.putImageData(enhancedImageData, 0, 0);
+    
+    // Additional contrast boost for better edge detection
+    enhancedCtx.globalCompositeOperation = 'source-over';
+    
+    return { canvas: enhancedCanvas, ctx: enhancedCtx };
+  };
+
   // ==================== CLIPS ERSTELLEN FUNKTIONEN ====================
   
   // Extract frames from video and create clips
@@ -1042,21 +1139,48 @@ export const ImageAnnotator = () => {
       
       ctx.drawImage(video, 0, 0);
       
-      // Convert canvas to blob
-      const blob = await new Promise<Blob>((blobResolve) => {
-        canvas.toBlob((b) => blobResolve(b!), 'image/jpeg', 0.95);
+      // Apply video enhancement if enabled (upscale + sharpen for better detection)
+      let detectionCanvas = canvas;
+      let detectionCtx = ctx;
+      
+      if (enhanceVideo && enhanceScale > 1) {
+        const enhanced = enhanceFrame(canvas, ctx, enhanceScale);
+        detectionCanvas = enhanced.canvas;
+        detectionCtx = enhanced.ctx;
+      }
+      
+      // Convert enhanced or original canvas to blob for detection
+      const detectionBlob = await new Promise<Blob>((blobResolve) => {
+        detectionCanvas.toBlob((b) => blobResolve(b!), 'image/jpeg', 0.95);
       });
       
       const frameNumber = globalFrameOffset + i;
-      const frameFile = new File([blob], `${videoFile.name}_frame_${frameNumber.toString().padStart(4, '0')}.jpg`, { type: 'image/jpeg' });
+      const frameFile = new File([detectionBlob], `${videoFile.name}_frame_${frameNumber.toString().padStart(4, '0')}.jpg`, { type: 'image/jpeg' });
       
-      // Personen-Erkennung durchführen
+      // Personen-Erkennung auf dem (evtl. verbesserten) Frame durchführen
       const detections = model ? await detectObjects(frameFile, confidenceThreshold) : [];
-      const personDetections = detections.filter(d => d.label.toLowerCase() === 'person');
+      
+      // Scale detections back to original coordinates if we enhanced the frame
+      const scaledDetections = enhanceVideo && enhanceScale > 1
+        ? detections.map(d => ({
+            ...d,
+            x: d.x / enhanceScale,
+            y: d.y / enhanceScale,
+            width: d.width / enhanceScale,
+            height: d.height / enhanceScale,
+          }))
+        : detections;
+      
+      const personDetections = scaledDetections.filter(d => d.label.toLowerCase() === 'person');
       
       // Frame nur behalten wenn mindestens eine Person erkannt wurde
       if (personDetections.length > 0) {
-        const url = URL.createObjectURL(blob);
+        // Create blob from ORIGINAL canvas for storage (not upscaled)
+        const storageBlob = await new Promise<Blob>((blobResolve) => {
+          canvas.toBlob((b) => blobResolve(b!), 'image/jpeg', 0.95);
+        });
+        const url = URL.createObjectURL(storageBlob);
+        const storageFile = new File([storageBlob], `${videoFile.name}_frame_${frameNumber.toString().padStart(4, '0')}.jpg`, { type: 'image/jpeg' });
         const currentFrameIndex = frames.length;
         
         // Motion blur check - mark blurry frames instead of skipping
@@ -1077,7 +1201,7 @@ export const ImageAnnotator = () => {
         }
         
         frames.push({
-          file: frameFile,
+          file: storageFile,
           url,
           detections: personDetections,
           frameNumber,
@@ -2025,6 +2149,10 @@ export const ImageAnnotator = () => {
               setFilterMotionBlur={setFilterMotionBlur}
               blurThreshold={blurThreshold}
               setBlurThreshold={setBlurThreshold}
+              enhanceVideo={enhanceVideo}
+              setEnhanceVideo={setEnhanceVideo}
+              enhanceScale={enhanceScale}
+              setEnhanceScale={setEnhanceScale}
               onClipsCreated={(newClips) => {
                 // Mark manual clips with isManual flag - but still run person detection!
                 const markedClips = newClips.map(clip => ({ ...clip, isManual: true }));
@@ -2243,6 +2371,45 @@ export const ImageAnnotator = () => {
                         </div>
                         <p className="text-xs text-muted-foreground mt-1">
                           Höher = weniger streng (mehr Bilder behalten). Niedrig = strenger (mehr unscharfe Bilder filtern)
+                        </p>
+                      </>
+                    )}
+                  </div>
+                  
+                  {/* Video Enhancement / Upscaling */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <p className="text-sm font-medium">
+                          Video-Verbesserung (Upscaling)
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          Verbessert schlechte Videoqualität
+                        </p>
+                      </div>
+                      <Button
+                        variant={enhanceVideo ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setEnhanceVideo(!enhanceVideo)}
+                      >
+                        {enhanceVideo ? "Aktiv" : "Aus"}
+                      </Button>
+                    </div>
+                    {enhanceVideo && (
+                      <>
+                        <div className="flex items-center gap-3">
+                          <span className="text-sm w-10">{enhanceScale}x</span>
+                          <Slider
+                            value={[enhanceScale]}
+                            onValueChange={([v]) => setEnhanceScale(v)}
+                            min={1.5}
+                            max={4}
+                            step={0.5}
+                            className="flex-1"
+                          />
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Höher = bessere Details für KI, aber langsamer. 2x empfohlen.
                         </p>
                       </>
                     )}
