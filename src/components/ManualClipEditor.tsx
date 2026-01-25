@@ -67,6 +67,9 @@ export const ManualClipEditor = ({
   // Pending marker start time for two-click marker creation
   const [pendingMarkerStart, setPendingMarkerStart] = useState<number | null>(null);
   
+  // Playback speed state
+  const [playbackSpeed, setPlaybackSpeed] = useState<1 | 2>(1);
+  
   // Smooth frame stepping state
   const [isKeyHeld, setIsKeyHeld] = useState(false);
   const keyHeldDirection = useRef<1 | -1 | null>(null);
@@ -123,6 +126,22 @@ export const ManualClipEditor = ({
     }
     setIsPlaying(!isPlaying);
   };
+
+  // Toggle playback speed between 1x and 2x
+  const togglePlaybackSpeed = () => {
+    const newSpeed = playbackSpeed === 1 ? 2 : 1;
+    setPlaybackSpeed(newSpeed);
+    if (videoRef.current) {
+      videoRef.current.playbackRate = newSpeed;
+    }
+  };
+
+  // Apply playback speed when video loads or speed changes
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.playbackRate = playbackSpeed;
+    }
+  }, [playbackSpeed, videoUrl]);
 
   // Add a marker at current time
   const addMarker = () => {
@@ -507,6 +526,45 @@ export const ManualClipEditor = ({
     };
   }, []);
 
+  // Handle space key for marker creation - USES videoRef.current.currentTime directly for accuracy!
+  const handleSpaceMarker = useCallback(() => {
+    if (duration === 0 || !videoRef.current) return;
+    
+    // CRITICAL: Use the ACTUAL video time, not the React state (which may be stale after frame stepping)
+    const actualVideoTime = videoRef.current.currentTime;
+    const snappedTime = snapToGrid(actualVideoTime);
+    
+    if (pendingMarkerStart === null) {
+      // First press - set start
+      setPendingMarkerStart(snappedTime);
+      // Also sync the React state to match
+      setCurrentTime(actualVideoTime);
+      toast.info(`▶ Start: ${formatTime(snappedTime)} - Drücke Space für Ende`);
+    } else {
+      // Second press - create marker
+      const startTime = Math.min(pendingMarkerStart, snappedTime);
+      const endTime = Math.max(pendingMarkerStart, snappedTime);
+      
+      if (endTime - startTime < 0.5) {
+        toast.error("Clip muss mindestens 0.5 Sekunden lang sein");
+        setPendingMarkerStart(null);
+        return;
+      }
+      
+      const newMarker: ClipMarker = {
+        id: Date.now().toString(),
+        startTime,
+        endTime,
+      };
+      
+      setMarkers(prev => [...prev, newMarker].sort((a, b) => a.startTime - b.startTime));
+      setPendingMarkerStart(null);
+      // Sync state
+      setCurrentTime(actualVideoTime);
+      toast.success(`✓ Clip erstellt: ${formatTime(startTime)} - ${formatTime(endTime)}`);
+    }
+  }, [duration, pendingMarkerStart]);
+
   // Keyboard shortcuts for frame stepping and marker creation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -570,40 +628,7 @@ export const ManualClipEditor = ({
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [videoUrl, isPlaying, duration, pendingMarkerStart, startContinuousStep, stopContinuousStep]);
-
-  // Handle space key for marker creation
-  const handleSpaceMarker = () => {
-    if (duration === 0) return;
-    
-    const snappedTime = snapToGrid(currentTime);
-    
-    if (pendingMarkerStart === null) {
-      // First press - set start
-      setPendingMarkerStart(snappedTime);
-      toast.info(`▶ Start: ${formatTime(snappedTime)} - Drücke Space für Ende`);
-    } else {
-      // Second press - create marker
-      const startTime = Math.min(pendingMarkerStart, snappedTime);
-      const endTime = Math.max(pendingMarkerStart, snappedTime);
-      
-      if (endTime - startTime < 0.5) {
-        toast.error("Clip muss mindestens 0.5 Sekunden lang sein");
-        setPendingMarkerStart(null);
-        return;
-      }
-      
-      const newMarker: ClipMarker = {
-        id: Date.now().toString(),
-        startTime,
-        endTime,
-      };
-      
-      setMarkers(prev => [...prev, newMarker].sort((a, b) => a.startTime - b.startTime));
-      setPendingMarkerStart(null);
-      toast.success(`✓ Clip erstellt: ${formatTime(startTime)} - ${formatTime(endTime)}`);
-    }
-  };
+  }, [videoUrl, isPlaying, duration, pendingMarkerStart, startContinuousStep, stopContinuousStep, handleSpaceMarker]);
 
   const { start: visibleStart, end: visibleEnd } = getVisibleRange();
 
@@ -784,8 +809,19 @@ export const ManualClipEditor = ({
             </Button>
             
             {/* Play/Pause */}
-            <Button onClick={togglePlayPause} variant="outline" size="sm" title="Play/Pause (Leertaste)">
+            <Button onClick={togglePlayPause} variant="outline" size="sm" title="Play/Pause (P)">
               {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+            </Button>
+            
+            {/* Playback Speed Toggle */}
+            <Button 
+              onClick={togglePlaybackSpeed} 
+              variant={playbackSpeed === 2 ? "default" : "outline"} 
+              size="sm"
+              title="Wiedergabegeschwindigkeit umschalten"
+              className="font-mono min-w-[40px]"
+            >
+              {playbackSpeed}x
             </Button>
             
             {/* Frame forward */}
