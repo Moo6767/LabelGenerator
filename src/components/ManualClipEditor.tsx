@@ -70,6 +70,9 @@ export const ManualClipEditor = ({
   // Playback speed state
   const [playbackSpeed, setPlaybackSpeed] = useState<1 | 2>(1);
   
+  // Local frame interval for manual clip editor (overrides prop)
+  const [localFrameInterval, setLocalFrameInterval] = useState<number>(frameInterval);
+  
   // Smooth frame stepping state
   const [isKeyHeld, setIsKeyHeld] = useState(false);
   const keyHeldDirection = useRef<1 | -1 | null>(null);
@@ -412,8 +415,8 @@ export const ManualClipEditor = ({
         const marker = markers[markerIdx];
         const frameTimes: number[] = [];
         
-        // Calculate ALL frame times based on frameInterval (no framesPerClip limit for manual clips)
-        for (let t = marker.startTime; t < marker.endTime; t += frameInterval) {
+        // Calculate ALL frame times based on localFrameInterval (no framesPerClip limit for manual clips)
+        for (let t = marker.startTime; t < marker.endTime; t += localFrameInterval) {
           frameTimes.push(t);
         }
         
@@ -766,6 +769,24 @@ export const ManualClipEditor = ({
               </p>
             </div>
           )}
+        </div>
+
+        {/* Frame Interval Setting */}
+        <div className="pt-2 border-t border-border/50">
+          <div className="flex justify-between text-sm mb-2">
+            <span className="text-muted-foreground">Frame-Intervall</span>
+            <span className="font-bold">{localFrameInterval.toFixed(1)}s = {(1 / localFrameInterval).toFixed(1)} FPS</span>
+          </div>
+          <Slider
+            value={[localFrameInterval]}
+            onValueChange={([v]) => setLocalFrameInterval(v)}
+            min={0.1}
+            max={1.0}
+            step={0.1}
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            {localFrameInterval <= 0.2 ? "Hohe Dichte" : localFrameInterval <= 0.5 ? "Standard" : "Schnell"} — Bei 10s Clip: ~{Math.ceil(10 / localFrameInterval)} Frames
+          </p>
         </div>
       </div>
 
